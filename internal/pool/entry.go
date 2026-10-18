@@ -83,26 +83,26 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
+	Realm string `json:"realm,omitempty"`
 	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
 	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
 	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
-	Enterprise      bool       `json:"enterprise,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Enterprise     bool   `json:"enterprise,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
 	// 账号本身健康，只是暂不接流量。
-	Paused          bool       `json:"paused,omitempty"`
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
-	LastSuccessTime time.Time  `json:"last_success,omitempty"`
-	LastErrTime     time.Time  `json:"last_err,omitempty"`
+	Paused          bool      `json:"paused,omitempty"`
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
 	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
-	CheckinDone bool        `json:"checkin_done,omitempty"`
-	TokenUsage  TokenUsage  `json:"token_usage,omitempty"`
+	CheckinDone bool       `json:"checkin_done,omitempty"`
+	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -113,6 +113,12 @@ type Status struct {
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
 	ConsecutiveFails int       `json:"consecutive_fails"`
 	DegradeUntil     time.Time `json:"degrade_until,omitempty"` // 连败降权截止（非零且未过 = 降权中）
+	// SessionDeadFails 连续 12153（ErrSessionDead）计数，即「离禁用还差几次」的进度。
+	// 此前只落 state.json 不透出：面板只能看到 disabled 与否，账号「已被判死 1/3」
+	// 这一中间态完全不可见——上游批量注销会话后，账号已不可用，面板仍显示「可用」，
+	// 直到每日 22:00 的保活连败满 3 次（≈3 天）才转 disabled（issue #215 复盘）。
+	// 透出后前端可提前打「疑似登录失效 · 待重登」，不必等账号变灰。
+	SessionDeadFails int `json:"session_dead_fails"`
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
@@ -204,9 +210,9 @@ type entry struct {
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
-	paused         bool
-	reason         string
-	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
+	paused   bool
+	reason   string
+	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -428,10 +434,10 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	ErrTotal    int64      `json:"err_total,omitempty"`
-	ErrCount       int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess    time.Time  `json:"last_success,omitempty"`
-	LastErr        time.Time  `json:"last_err,omitempty"`
+	ErrTotal    int64     `json:"err_total,omitempty"`
+	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastErr     time.Time `json:"last_err,omitempty"`
 	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
 	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
 	LastCheckinDay string     `json:"last_checkin_day,omitempty"`

@@ -196,6 +196,12 @@ type fakeUpstream struct {
 	travelCalls    atomic.Int32
 	resourceRemain int64
 	resourceEnd    string
+	// resourceStatus / refreshStatus 非 0 时对应端点按该状态码返回失败响应，
+	// 用于模拟「上游批量注销会话」：billing 401 HTML + refresh 401/12153。
+	resourceStatus int
+	refreshStatus  int
+	// refreshBody 非空时作为 refresh 失败响应体（默认 12153 session dead）。
+	refreshBody string
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -205,6 +211,11 @@ func (f *fakeUpstream) server() *httptest.Server {
 			f.checkinCalls.Add(1)
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
+			if f.resourceStatus != 0 {
+				w.WriteHeader(f.resourceStatus)
+				w.Write([]byte("<html><head><title>401 Authorization Required</title></head><body>APISIX</body></html>"))
+				return
+			}
 			// remain 需 <= size（取数钳 [0,size]：脏数据 remain>size 会被钳到 size
 			// ——上游真实数据恒一致，实测 Cycle{17,482,500}）。
 			end := ""
@@ -215,6 +226,15 @@ func (f *fakeUpstream) server() *httptest.Server {
 				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0` + end + `}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
+			if f.refreshStatus != 0 {
+				body := f.refreshBody
+				if body == "" {
+					body = `{"code":12153,"msg":"12153:refresh token is invalid"}`
+				}
+				w.WriteHeader(f.refreshStatus)
+				w.Write([]byte(body))
+				return
+			}
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
 		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/info"):
 			// 已领养（data.buddy 非空）：跳过领养前置，直接进旅行状态查询。
@@ -424,6 +444,111 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	// 禁用账号不参与：其 credits 保持 0（未被 UserResource 覆盖解冻）。
 	if st2, _ := p.Status("u2"); !st2.Disabled {
 		t.Errorf("u2 must stay disabled")
+	}
+}
+
+// TestRunBalanceRefresh401SessionDeadDisables 余额探测连续 401 且 refresh 判死时，
+// 按 session dead 阈值在分钟级（探测周期）内禁用，而不是等每日保活（issue #215：
+// 上游批量注销会话后，面板仍显示可用近 3 天）。
+func TestRunBalanceRefresh401SessionDeadDisables(t *testing.T) {
+	f := &fakeUpstream{
+		resourceStatus: 401,
+		refreshStatus:  401,
+		refreshBody:    `{"code":12153,"msg":"12153:refresh token is invalid"}`,
+	}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	threshold := pool.SessionDeadThreshold()
+	for i := 1; i < threshold; i++ {
+		s.RunBalanceRefreshNow()
+		st, _ := p.Status("u1")
+		if st.Disabled {
+			t.Fatalf("第 %d 次探测即禁用（阈值 %d）", i, threshold)
+		}
+		if st.SessionDeadFails != i {
+			t.Fatalf("第 %d 次探测后 session_dead_fails=%d want %d", i, st.SessionDeadFails, i)
+		}
+	}
+	s.RunBalanceRefreshNow()
+	if st, _ := p.Status("u1"); !st.Disabled {
+		t.Fatalf("连续 %d 次 401+12153 后应禁用: %+v", threshold, st)
+	}
+}
+
+// TestRunBalanceRefresh401HealsViaRefresh 401 但 refresh 成功（降级/漂移 token，
+// chat 仍可用）时不判死：换新 token、清计数，账号留在池里——避免误杀 issue #215
+// 评论里那类「billing 恒 401 但 chat 正常」的号。
+func TestRunBalanceRefresh401HealsViaRefresh(t *testing.T) {
+	f := &fakeUpstream{resourceStatus: 401}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 9999999999}
+	p.Add(a)
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunBalanceRefreshNow()
+	st, _ := p.Status("u1")
+	if st.Disabled || st.SessionDeadFails != 0 {
+		t.Fatalf("降级 token 不应判死: disabled=%v fails=%d", st.Disabled, st.SessionDeadFails)
+	}
+	if f.refreshCalls.Load() != 1 {
+		t.Errorf("refresh calls=%d want 1（401 需一次求证）", f.refreshCalls.Load())
+	}
+	if a.AccessToken != "new" {
+		t.Errorf("token 未更新: %s", a.AccessToken)
+	}
+}
+
+// TestRunBalanceRefreshNon401SkipsRefresh 非 401 的探测失败不触发登录态求证：
+// 5xx/限流/WAF 各有既有惩罚路径，不重复计罚（同 degrade.go「不叠加」纪律）。
+func TestRunBalanceRefreshNon401SkipsRefresh(t *testing.T) {
+	f := &fakeUpstream{resourceStatus: 403}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunBalanceRefreshNow()
+	if n := f.refreshCalls.Load(); n != 0 {
+		t.Errorf("refresh calls=%d want 0（非 401 不求证）", n)
+	}
+	if st, _ := p.Status("u1"); st.SessionDeadFails != 0 || st.Disabled {
+		t.Errorf("403 不该计 session dead: %+v", st)
+	}
+}
+
+// TestRunBalanceRefresh401HealBackoff 降级 token（billing 恒 401、refresh 正常）在
+// 退避窗口内只求证一次：否则每 5 分钟轮换一次 refresh token（一天 288 次），既换不回
+// 可用凭据，又平白放大上游风控与并发竞态。
+func TestRunBalanceRefresh401HealBackoff(t *testing.T) {
+	f := &fakeUpstream{resourceStatus: 401}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunBalanceRefreshNow()
+	s.RunBalanceRefreshNow()
+	if n := f.refreshCalls.Load(); n != 1 {
+		t.Errorf("refresh calls=%d want 1（退避窗口内不重复求证）", n)
+	}
+	if st, _ := p.Status("u1"); st.SessionDeadFails != 0 || st.Disabled {
+		t.Errorf("降级 token 不该判死: %+v", st)
 	}
 }
 
@@ -673,7 +798,6 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 		t.Errorf("checkin calls=%d want 2（正常 + 暂停参与；禁用跳过）", got)
 	}
 }
-
 
 // TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
 // 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的

@@ -22,6 +22,15 @@ import (
 type Auth struct {
 	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
 	mu sync.Mutex
+	// refreshMu 串行化同一账号的 token 刷新（含网络 I/O）。refreshToken 是一次性
+	// 凭证：两个 goroutine 同时拿同一个 RT 发刷新请求时，上游会把第二次判定为
+	// 12153 refresh token is invalid 并作废整条 RT 链。mu 只保护字段读写、不覆盖
+	// 锁外 I/O，挡不住这种并发；必须用独立锁把整个刷新过程串起来。
+	refreshMu sync.Mutex
+	// refreshGen 每次刷新成功自增。等待 refreshMu 的 goroutine 据此判断「等待期间
+	// 是否已有其他刷新完成」，有则直接复用结果、不再重复请求（消耗新 RT）。
+	// 用 atomic 读写：刷新成功时可能仍持有 mu（写回临界区），不能再抢 mu。
+	refreshGen atomic.Uint64
 
 	AccessToken  string
 	RefreshToken string
@@ -50,6 +59,31 @@ func (a *Auth) Lock() { a.mu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
+
+// LockRefresh 获取账号级刷新锁。调用方必须在**整个刷新过程**（含网络 I/O）持有，
+// 直到刷新结果写回或失败返回；只保护刷新，不阻塞 AccessTokenValue / SaveAtomic。
+func (a *Auth) LockRefresh() { a.refreshMu.Lock() }
+
+// UnlockRefresh 释放 a.LockRefresh 获取的锁。
+func (a *Auth) UnlockRefresh() { a.refreshMu.Unlock() }
+
+// RefreshGeneration 返回成功刷新次数。刷新前取快照，拿到 LockRefresh 后复查：
+// 若已变化，说明等待期间另一个 goroutine 已完成刷新，本次可直接复用新 token。
+func (a *Auth) RefreshGeneration() uint64 {
+	if a == nil {
+		return 0
+	}
+	return a.refreshGen.Load()
+}
+
+// NoteRefreshSuccess 记录一次成功刷新（刷新代数 +1），供并发等待者复用结果。
+// 可在持有 a.mu 的写回临界区内调用（atomic，不抢锁）。
+func (a *Auth) NoteRefreshSuccess() {
+	if a == nil {
+		return
+	}
+	a.refreshGen.Add(1)
+}
 
 // AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
 //

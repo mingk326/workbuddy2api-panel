@@ -125,6 +125,10 @@ const loginTTL = 15 * time.Minute
 type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
+	// processing 该 state 正在落盘（含签到/余额校验等副作用）。
+	// 前端每 3s 轮询，而成功分支的副作用可能耗时数秒（UserResource 慢时更久）：
+	// 没有这个闸门，第二个并发 poll 会把整段流程（落盘/签到/入池）再跑一遍。
+	processing bool
 }
 
 // New 构建面板。

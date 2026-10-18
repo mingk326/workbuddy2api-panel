@@ -4,7 +4,7 @@ const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
-let logPin = true, loginState = null, loginTimer = null;
+let logPin = true, loginState = null, loginTimer = null, loginFails = 0;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
@@ -45,9 +45,11 @@ async function api(path, opts = {}) {
   if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
-  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+  if (r.status === 401) { openKey(); const e = new Error('密钥无效或未填写'); e.status = 401; throw e; }
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  // status 挂到错误上：调用方靠它区分「可重试的抖动」与「重试无意义的终态」
+  // （登录轮询要据此决定继续等 OAuth 还是提示重新发起，见 pollLogin）。
+  if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.status = r.status; throw e; }
   return d;
 }
 function toast(msg, cls) {
@@ -338,6 +340,14 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
+// invalidatePackages：账号/凭据发生变更时作废 packages 缓存。
+// 登录、导入、移除、解冻、余额刷新都会换 token 或改余额，旧缓存里的 401 行与旧余额
+// 会一直顶到 EXP_FRESH_MS——表现为「刚重新登录，点检查还是 401」。
+function invalidatePackages() {
+  lastPackages = null;
+  lastPackagesAt = 0;
+}
+
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
@@ -387,6 +397,11 @@ function renderAccounts(list) {
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
+    } else if (s.session_dead_fails > 0) {
+      // 会话疑似失效（12153 连续计数已 >0，但还没到禁用阈值）：上游已经判死、账号
+      // 尚留在池里。此前这种中间态完全不可见，面板照样打「可用」——见 issue #215。
+      cls = 'cool';
+      tag = '<span class="tag warn">疑似登录失效 · 待重登</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
@@ -553,7 +568,11 @@ $('accBody').addEventListener('click', async ev => {
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
     }
   } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; loadOverview(true); }
+  finally {
+    b.disabled = false;
+    if (a !== 'tasks') invalidatePackages();     // 账号动作会改 token/余额/池状态
+    loadOverview(true);
+  }
 });
 
 $('btnCheckinAll').onclick = async () => {
@@ -1133,6 +1152,7 @@ function startAddLogin() {
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
+  loginFails = 0;
   api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
     loginState = r.state;
     $('addUrl').textContent = r.url;
@@ -1153,18 +1173,39 @@ async function pollLogin() {
   if (!loginState) return;
   try {
     const r = await api('login/poll?state=' + encodeURIComponent(loginState));
+    loginFails = 0;
     if (r.done) {
       stopPoll();
       $('addReady').hidden = true;
       $('addDone').hidden = false;
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
+      const warn = r.balance_error ? '；但余额校验失败：' + r.balance_error + '（若持续 401，请在浏览器退出腾讯账号后重登）' : '';
+      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
+      // 凭据已换新：积分构成 / 到期明细缓存里的旧 401 行必须作废，否则用户点「检查」
+      // 仍会看到上一条 401（缓存 2 分钟内复用），误以为"重新登录没用"。
+      invalidatePackages();
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
   } catch (e) {
-    stopPoll();
-    $('addReady').hidden = true;
+    // 404/410：授权会话作废（进程重启或超过 15 分钟），继续轮询没有意义。
+    if (e.status === 404 || e.status === 410) {
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addErr').hidden = false;
+      $('addErr').textContent = '登录会话已过期，请关闭后重新添加';
+      return;
+    }
+    // 其余（网络抖动 / 网关 502 / 上游瞬时失败）保留轮询：OAuth 已在浏览器完成，
+    // 此刻停掉会让用户以为"重新登录没用"，实际只是这次没收到结果。
+    loginFails++;
+    if (loginFails >= 20) {
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addErr').hidden = false;
+      $('addErr').textContent = '连续 20 次查询失败，已停止轮询：' + e.message + '（授权可能已完成，可关闭后重新添加）';
+      return;
+    }
     $('addErr').hidden = false;
-    $('addErr').textContent = e.message + '（关闭后重新添加）';
+    $('addErr').textContent = '网络中断，自动重试中（' + loginFails + '/20）：' + e.message;
   }
 }
 function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
@@ -1191,6 +1232,7 @@ $('importFile').onchange = async () => {
     if (d.errors && d.errors.length) {
       console.warn('import errors:', d.errors);
     }
+    invalidatePackages();
     loadOverview(true);
   } catch (e) {
     $('importErr').hidden = false;
@@ -1206,9 +1248,10 @@ $('btnRefresh').onclick = async () => {
   b.disabled = true; b.textContent = '刷新中…';
   try {
     await api('balance_all', { method: 'POST' });
+    invalidatePackages();
     await loadOverview(true);
     toast('余额已从上游刷新', 'ok');
-  } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
+  } catch (e) { toast('刷新失败：' + e.message, 'err'); invalidatePackages(); await loadOverview(true); }
   finally { b.disabled = false; b.textContent = '刷新'; }
   if (view === 'logs') loadLogs();
 };
@@ -1386,13 +1429,14 @@ $('taskBody').addEventListener('click', async ev => {
         else if (r.attempt && !advanced) msg += '；进度未动，该任务可能需要官方客户端';
         toast(msg, (r.claimed || advanced) ? 'ok' : 'err');
       }
+      invalidatePackages();
       loadOverview(true);
     } else {
       const path = 'accounts/' + encodeURIComponent(taskUID) + '/tasks/' + (kind === 'claim' ? 'claim' : 'accept');
       const body = kind === 'claim' ? { task_code: code } : { task_codes: [code] };
       await api(path, { method: 'POST', body: JSON.stringify(body) });
       toast(kind === 'claim' ? '已领取奖励' : '已接受任务', 'ok');
-      if (kind === 'claim') loadOverview(true);
+      if (kind === 'claim') { invalidatePackages(); loadOverview(true); }
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { loadTasks(); }

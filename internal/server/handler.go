@@ -792,7 +792,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					// 与保活同口径：连续 3 次 12153 才禁用。单次 12153 多为网络抖动 /
+					// 刷新竞态（并发刷新消费了同一个一次性 RT），一次就 Disable 会把
+					// 健康账号误踢成"掉登录"。
+					if h.cfg.Pool.NoteSessionDead(acct.UID) {
+						log.Printf("ERR: [server] chat refresh acct=%s: 连续 %d 次 12153 session dead — 禁用",
+							logfmt.Label(acct.UID, acct.Nickname), pool.SessionDeadThreshold())
+					}
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -802,6 +808,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			// 刷新成功即证明 session 仍存活：清连续 12153 计数（与保活同口径）。
+			h.cfg.Pool.ClearSessionDead(acct.UID)
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
 				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
@@ -939,6 +947,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg,
 					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
+			// 6021「queue.full.title」渠道级容量满载：**不罚号不轮转**，立即透传
+			// 上游原文回客户端（503 + upstream_busy）。上游集群排队打满时换任何
+			// 账号都撞同一堵墙——按限流处置会逐号软冷却，实测 2 秒绞杀整池健康号
+			// （2026-10-15 实案），且换号白撞把无效请求放大 MaxRotate 倍。客户端
+			// 按 Retry-After 退避重试即可；等待窗口过去渠道恢复即成功。
+			if kind == upstream.ErrUpstreamBusy {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream capacity is full (queue.full); retry after a short wait"
+				}
+				w.Header().Set("Retry-After", "5")
+				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_busy", msg,
+					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
@@ -1151,6 +1178,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				code = "waf_ip_blocked"
 				msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
 			}
+		case upstream.ErrUpstreamBusy:
+			// 6021 queue.full 渠道级容量满载（防御路径：正常已在轮转循环内
+			// fail-fast 拦截）。503 + Retry-After + 可重试语义——上游原文
+			// （下方统一透传）含 requestId，客户端按退避重试即可。
+			code = "upstream_busy"
+			msg = "upstream capacity is full (queue.full); retry after a short wait"
+			w.Header().Set("Retry-After", "5")
 		case upstream.ErrModelBlocked:
 			// 11102「该后端无此模型」：上游原文（下方统一透传）已经写清了原因，但
 			// code 此前停在默认的 no_healthy_account —— 那是"服务端过载"的语义，
@@ -1412,6 +1446,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；chatCompletions
 		// 已 fail-fast 400 透传原文、终止轮转——「换号可能有不同模型权限」属 11102
 		// （ErrModelBlocked）的分类域，与本类无关。
+	case upstream.ErrUpstreamBusy:
+		// 6021「queue.full.title」渠道级容量满载：账号余额健康、未限流、session 未死，
+		// 换号也撞同一堵墙。零动作（不冷却/不熔断/不 NoteError/不喂连败，同
+		// ErrContentBlocked 待遇）；chatCompletions 已 fail-fast 503 透传原文、
+		// 终止轮转——该分支只为文档完备。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
 		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。

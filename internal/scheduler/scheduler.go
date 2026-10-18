@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,6 +83,44 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// authHealMu/authHealAt 401→refresh 求证的退避记账（uid → 上次求证时刻）。
+	// 见 allowAuthHeal：降级 token 会让每轮探测都 401，不设退避就是每 5 分钟轮换一次 RT。
+	authHealMu sync.Mutex
+	authHealAt map[string]time.Time
+}
+
+// authHealBackoff 同一账号 401→refresh 求证的最小间隔。
+// 降级 token（billing 恒 401、chat 可用，issue #215 评论实测）每轮余额探测都会命中
+// 401；若每轮都 refresh，一天会轮换 288 次 RT——既换不来可用凭据，又平白放大上游
+// 风控与并发竞态。窗口内只记录日志、不再刷新；真死号走 refresh 12153 分支（不吃退避，
+// 首次即判死），因此退避不影响「15 分钟禁用」的主路径。
+const authHealBackoff = 30 * time.Minute
+
+// allowAuthHeal 退避窗口判定：窗口内已「成功求证」过就不再刷新。
+// 只记录成功（refresh 返回 nil）——真死号每轮 refresh 都回 12153 且不轮换 RT，
+// 必须每轮都试，连续计数才能按预期在 3 次（≈15 分钟）内判死；把失败也记进退避
+// 会让死号永远停在 1/3。
+func (s *Scheduler) allowAuthHeal(uid string) bool {
+	s.authHealMu.Lock()
+	defer s.authHealMu.Unlock()
+	if s.authHealAt == nil {
+		s.authHealAt = make(map[string]time.Time)
+	}
+	if t, ok := s.authHealAt[uid]; ok && time.Since(t) < authHealBackoff {
+		return false
+	}
+	return true
+}
+
+// noteAuthHeal 记录一次「refresh 成功」的求证时刻（供 allowAuthHeal 退避）。
+func (s *Scheduler) noteAuthHeal(uid string) {
+	s.authHealMu.Lock()
+	defer s.authHealMu.Unlock()
+	if s.authHealAt == nil {
+		s.authHealAt = make(map[string]time.Time)
+	}
+	s.authHealAt[uid] = time.Now()
 }
 
 // New 构建。
@@ -629,6 +668,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+				s.noteBalanceAuthFailure(a, uid, err)
 				return
 			}
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
@@ -636,6 +676,64 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		}(a, st.UID)
 	}
 	wg.Wait()
+}
+
+// noteBalanceAuthFailure 余额探测拿到 401 时的「登录态求证 + 计罚」。
+//
+// 为什么需要它（issue #215 复盘）：余额刷新是池内唯一的分钟级健康观测量，但此前
+// 拿到错误只写一行日志（RunBalanceRefreshNow 的 err 分支），从不触碰池状态。上游
+// 批量注销会话那天，号在 billing/chat 两侧都已 401，面板却继续显示「可用」，要等
+// 每日 22:00 的保活连续失败 3 次（≈3 天）才转 disabled——期间运维看不到任何信号。
+//
+// 为什么不能把 401 直接当 ErrSessionDead 计罚：401 有两种成因，
+//  1. 会话被上游注销（Keycloak session 没了，refresh 回 12153）→ 需重登，应计罚；
+//  2. 渠道换回「降级 token」（issue #215 评论实测：billing/growth 恒 401，chat 仍可用）
+//     → 号还能干活，计罚会误杀。
+//
+// 用 refresh 做一次权威求证即可分开：refresh 成功 = 会话还活着（降级 token 场景，
+// 顺手换成新 token 并清计数，下一轮探测复核）；refresh 返回 12153 = 会话真死，交给
+// NoteSessionDead 的连续计数（3 次 × 5 分钟 ≈ 15 分钟，远快于每日保活）。
+//
+// 只对 401 生效：其余错误（5xx/限流/传输层）各有既有惩罚路径，不在此重复计罚
+// （两机制并存取更长者，不叠加——同 degrade.go 的纪律）。
+func (s *Scheduler) noteBalanceAuthFailure(a *auth.Auth, uid string, probeErr error) {
+	var ue *upstream.Error
+	if !errors.As(probeErr, &ue) || ue.Status != http.StatusUnauthorized {
+		return
+	}
+	// 没有 RT 就无法求证（静态 key / 企业号等形态）：保持「只记日志」的旧语义。
+	if a.RefreshTokenValue() == "" {
+		return
+	}
+	label := logfmt.Label(uid, a.Nickname)
+	if !s.allowAuthHeal(uid) {
+		// 退避窗口内已求证过：仍 401 说明是降级 token（refresh 换不回可用凭据），
+		// 本轮不刷新，避免每 5 分钟轮换一次 RT。
+		log.Printf("balance %s: 401（%s 内已求证过登录态，本轮跳过 refresh）", label, authHealBackoff)
+		return
+	}
+	rerr := s.cfg.Upstream.RefreshToken(a)
+	if rerr == nil {
+		s.noteAuthHeal(uid)
+		if serr := a.SaveAtomic(); serr != nil {
+			log.Printf("balance %s: 401 后刷新成功但落盘失败: %v", label, serr)
+		}
+		s.cfg.Pool.ClearSessionDead(uid)
+		log.Printf("balance %s: 401 经 refresh 求证为降级/漂移 token（会话仍活），已换新 token 并清 session dead 计数", label)
+		return
+	}
+	var re *upstream.Error
+	if errors.As(rerr, &re) && re.Kind == upstream.ErrSessionDead {
+		if s.cfg.Pool.NoteSessionDead(uid) {
+			log.Printf("balance %s: 连续 %d 次 401 且 refresh 判死 — 禁用（需重新登录）", label, pool.SessionDeadThreshold())
+			return
+		}
+		if st, ok := s.cfg.Pool.Status(uid); ok {
+			log.Printf("balance %s: 401 且 refresh 判死（session dead 计数 %d/%d）", label, st.SessionDeadFails, pool.SessionDeadThreshold())
+		}
+		return
+	}
+	log.Printf("balance %s: 401 但 refresh 失败（非 session dead，不计入禁用）: %v", label, rerr)
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。

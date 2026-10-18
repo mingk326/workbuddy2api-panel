@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,6 +97,18 @@ func TestClassify(t *testing.T) {
 		{429, `{"error":{"data":{"code":"14018","msg":"Credits exhausted"}}}`, ErrHardCredit},
 		{429, `{"requestId":"14018","msg":"Credits exhausted"}`, ErrSoftRate},
 		{429, `{"code":1,"msg":"Credits exhausted"}`, ErrSoftRate},
+		// 6021「queue.full.title」渠道级容量满载（2026-10-15 实案）：不是账号问题，
+		// 必须归 ErrUpstreamBusy（不罚号不轮转）——按 ErrSoftRate 逐号软冷却会在
+		// 秒级把整池健康号误杀。结构化 code 与固定文案双判据。
+		{429, `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea3a771e835e388328713d47cf"}`, ErrUpstreamBusy},
+		{429, `{"error":{"data":{"code":6021,"msg":"queue.full.title"}}}`, ErrUpstreamBusy},
+		{429, `queue.full.title`, ErrUpstreamBusy},
+		{429, `{"code":6021,"msg":"queue full"}`, ErrUpstreamBusy},
+		// 文案外卡不绑 429（上游若换状态码仍须识别为渠道满载，不得落 hardMarkers 族）。
+		{500, `{"code":6021,"msg":"queue.full.title"}`, ErrUpstreamBusy},
+		// 防过宽：普通限流文案不带 queue.full，仍走软限流。
+		{429, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
+		{429, `{"requestId":"6021","msg":"rate limit"}`, ErrSoftRate},
 		// WAF 403（P0-1）：403 + 无业务信封（无 "code":/"msg": 字段）→ ErrWafBlock。
 		// 空体 / HTML 拦截页 / 纯文本 / 非信封 JSON 均命中。
 		{403, ``, ErrWafBlock},
@@ -230,6 +244,51 @@ func TestRefreshPreservesExpiryWhenOmitted(t *testing.T) {
 	}
 	if a.RefreshToken != "rt" {
 		t.Errorf("refreshToken should be preserved, got %s", a.RefreshToken)
+	}
+}
+
+// TestRefreshSerializedPerAccount 钉住单飞语义：同一账号并发刷新只允许消费一次
+// refreshToken（RT 一次性，第二个并发请求会被上游判 12153 并作废整条链）。
+func TestRefreshSerializedPerAccount(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		n := calls.Add(1)
+		if n == 1 {
+			<-release // 首个请求挂起，给第二个 goroutine 足够时间进入刷新入口并等待
+		}
+		return jsonResp(200, fmt.Sprintf(
+			`{"code":0,"data":{"accessToken":"at%d","refreshToken":"rt%d","expiresIn":3600}}`, n, n)), nil
+	})
+	a := &auth.Auth{AccessToken: "at0", RefreshToken: "rt0", ExpiresAt: 1}
+
+	entered := make(chan struct{}, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			entered <- struct{}{}
+			errs[i] = c.RefreshToken(a)
+		}(i)
+	}
+	<-entered
+	<-entered
+	time.Sleep(50 * time.Millisecond) // 两个 goroutine 都已完成代数快照
+	close(release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("refresh requests=%d want 1（RT 只能被消费一次）", got)
+	}
+	if a.AccessToken != "at1" || a.RefreshToken != "rt1" {
+		t.Errorf("tokens not updated from single refresh: at=%s rt=%s", a.AccessToken, a.RefreshToken)
 	}
 }
 

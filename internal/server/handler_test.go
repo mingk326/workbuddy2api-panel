@@ -167,6 +167,52 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
+// TestChatQueueFullFailsFastWithoutPenalty 上游 429 + code 6021「queue.full.title」
+// 是渠道级容量满载（推理集群排队打满），**不是账号问题**（2026-10-15 实案：按
+// 限流逐号软冷却，2 秒绞杀整池健康号）。端到端断言：不轮转（只打一次上游）、
+// 直接回 503 + upstream_busy + Retry-After（可重试语义）、账号零惩罚。
+func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 429, `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea3a771e835e388328713d47cf"}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "busy1", AccessToken: "at-busy1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "busy2", AccessToken: "at-busy2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("busy1", 2000, 0) // 确定性源 r=0 → 先选 busy1
+	p.SetCredits("busy2", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s (want 503: channel-level busy, client should back off and retry)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 0 {
+		t.Errorf("calls=%v want busy1 1 次、busy2 0 次（零轮转）", calls)
+	}
+	// 账号完好：无冷却、无熔断计数、无连败降权。
+	st, _ := p.Status("busy1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("ErrUpstreamBusy must not penalize account: %+v", st)
+	}
+	// 响应体：上游原文透传（requestId 在场）+ upstream_busy code + Retry-After。
+	body := rec.Body.String()
+	if !strings.Contains(body, "6021") || !strings.Contains(body, "queue.full.title") {
+		t.Errorf("503 message should carry upstream 6021 info: %s", body)
+	}
+	if !strings.Contains(body, "upstream_busy") {
+		t.Errorf("503 body should carry upstream_busy code: %s", body)
+	}
+	if strings.Contains(body, "no_healthy_account") {
+		t.Errorf("channel-busy failure must not be reported as account exhaustion: %s", body)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After=%q want 5", got)
+	}
+}
+
 // TestChatBadParams400CarriesUpstreamBody 11101 的 400 响应必须包含上游原始
 // 11101 信息（含 requestId，客户端据此排查），且不再出现空洞的 no_healthy_account。
 func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
@@ -779,6 +825,48 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	st, _ := p.Status("u1")
 	if !st.Disabled {
 		t.Errorf("account should be disabled: %+v", st)
+	}
+}
+
+// TestChatRefreshSessionDeadRequiresThreshold 刷新路径的 12153 与保活同口径：
+// 连续 3 次才禁用；单次多为抖动/刷新竞态，不得把健康账号误踢成"掉登录"。
+func TestChatRefreshSessionDeadRequiresThreshold(t *testing.T) {
+	p := testPoolWith(&auth.Auth{
+		UID: "u1", AccessToken: "at1", RefreshToken: "rt1",
+		ExpiresAt: time.Now().Add(-time.Minute).Unix(), // 已过期 → 每次请求都先刷新
+	})
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+				return &http.Response{
+					StatusCode: 401,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":12153,"msg":"Offline user session not found"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	for i := 1; i <= 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		st, _ := p.Status("u1")
+		if st.Disabled {
+			t.Fatalf("第 %d 次刷新 12153 不应禁用: %+v", i, st)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("连续第 3 次刷新 12153 应禁用: %+v", st)
 	}
 }
 

@@ -163,11 +163,32 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.loginMu.Lock()
 	sess, known := p.logins[state]
-	p.loginMu.Unlock()
-	if !known {
-		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
+	if known && sess.processing {
+		p.loginMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "正在写入凭据…"})
 		return
 	}
+	if known {
+		sess.processing = true
+		p.logins[state] = sess
+	}
+	p.loginMu.Unlock()
+	if !known {
+		// 410：state 已作废（进程重启或超过 loginTTL）。前端据此停止轮询；网络抖动
+		// （5xx/超时）则继续重试——两者混成一个状态码时，一次抖动就会让用户放弃等待，
+		// 而 OAuth 其实已在浏览器侧完成、账号却不会入池（「重新登录没用」的成因之一）。
+		writeErr(w, http.StatusGone, "login session 已过期，请关闭后重新添加账号")
+		return
+	}
+	defer func() {
+		// 成功路径已 delete(state)，这里只清理失败路径的闸门，供用户重试。
+		p.loginMu.Lock()
+		if s, ok := p.logins[state]; ok {
+			s.processing = false
+			p.logins[state] = s
+		}
+		p.loginMu.Unlock()
+	}()
 	_, epToken, epAcct, origin := loginEndpoints(sess.realm)
 
 	// auth/token 是权威登录状态端点：pending 时业务 code 非 0（"login ing"）。
@@ -271,9 +292,16 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 			checkinMsg = err.Error()
 		}
 	}
+	balanceErr := ""
 	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
 		remain, total = rm, tt
 		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
+	} else {
+		// 凭据已落盘，但上游仍拒绝 billing（典型：旧会话没清干净 / 渠道降级 token）。
+		// 不把登录判失败（chat 可能可用），但必须如实告诉运维"这次登录没换来可用凭据"，
+		// 否则就是「面板说已添加、查询依旧 401」的静默失败。
+		balanceErr = err.Error()
+		log.Printf("panel: 登录后余额校验失败 uid=%s: %v", acct.UID, err)
 	}
 
 	p.loginMu.Lock()
@@ -288,6 +316,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"credits":         remain,
 		"credits_total":   total,
 		"checkin_message": checkinMsg,
+		"balance_error":   balanceErr,
 	})
 }
 
