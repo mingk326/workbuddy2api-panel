@@ -31,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.4-panel"
+const appVersion = "1.13.6-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -288,6 +288,16 @@ func main() {
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
+	// 任务补领清扫（issue #174）：分钟级、只 accept/claim，把「已达标没人领」的成长
+	// 任务奖励领掉。成长队列跑的是行为链路（贵、一天一次），清扫几乎零负担故可高频；
+	// hook 已挂载、循环由 StartTaskSweep 按 interval 启动（关闭时 interval=0 → 不启动）。
+	sch.SetTaskSweepHook(func() { pn.RunTaskSweepOnce() })
+	switch {
+	case !cfg.Schedule.TaskSweepEnabled:
+		log.Printf("任务补领清扫已禁用（schedule.task_sweep_enabled=false）")
+	case cfg.TaskSweepInterval > 0:
+		log.Printf("任务补领清扫：每 %s（补领已达标未领的成长任务奖励）", cfg.TaskSweepInterval)
+	}
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
@@ -316,6 +326,7 @@ func main() {
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -504,6 +515,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
 	return restartRequiredFields(newCfg), nil

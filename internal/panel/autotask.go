@@ -14,9 +14,10 @@
 //   - expert_5 / Expert_team_use_3：真实专家列表 + 召唤链 + 真实 chat（服务端 requestId）
 //   - expert_actual_use（三账号实测）
 //   - Hp_Appearance：appearance/set + appearance_skin_apply 事件（两账号实测）
+//   - WorkBuddy_Valorant：与 Expert_lighthouse 同构（ex_xQHHD1u5Jkua，点亮未实测）
 //
 // 仍未破解：skill_1（疑似要求真实 Skill 工具调用）。
-// 不做：Expert_lighthouse（需真实连接器授权）、Expert_Philanthropy（真实捐款）。
+// 不做：Expert_Philanthropy（真实捐款）。
 //
 // 所有动作幂等：已 claimed/已达标的任务直接跳过，不重复消耗上游配额。
 package panel
@@ -129,6 +130,12 @@ var autoActions = []autoAction{
 		run:      runExpertLighthouse,
 	},
 	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "无畏契约拼豆专家召唤+使用链（与 Expert_lighthouse 同构，点亮未实测）",
+		Attempt:  true,
+		run:      runValorantExpert,
+	},
+	{
 		TaskCode: "black_cat",
 		Desc:     "夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示稍后再试）",
 		Attempt:  true,
@@ -214,6 +221,16 @@ var mpTaskCodes = map[string]bool{
 
 // isMPTaskCode 报告任务是否小程序口径专属（决定回读/接受/领奖走 mp 变体）。
 func isMPTaskCode(code string) bool { return mpTaskCodes[code] }
+
+// claimTaskReward 按口径领取任务奖励：mp 专属任务走 mp 变体端点（缺 mp 头上游返回
+// task not found），其余走 Web 域端点。claim 幂等（重复领返回 already_claimed
+// → 0 分 0 能），调用方可安全重试。
+func claimTaskReward(p *Panel, a *auth.Auth, code string, mpOnly bool) (credit, energy int64, err error) {
+	if mpOnly || isMPTaskCode(code) {
+		return p.cfg.Upstream.ClaimRewardMP(a, code)
+	}
+	return p.cfg.Upstream.ClaimReward(a, code)
+}
 
 // taskByCode 拉取任务列表并定位单个任务；未找到返回 nil（不视为错误）。
 // 双口径：mp 专属任务在默认列表查不到，自动回落 mp 列表（仅对已登记的 mp 码，
@@ -937,50 +954,70 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 	return "已上报真实对话 + skill_info 技能加载事件", nil
 }
 
+// runExpertLocal 通用「LOCAL 模式专家」召唤+使用链（Expert_lighthouse 系任务同构）：
+// 市场列表命中真实条目则用其信息（version 等以服务端为准）→ 召唤链 → 真实 chat
+// 取服务端 requestId → chat 链 agent_task_created 补 has_expert/expert_id →
+// expert_actual_use(mode=LOCAL)。对齐真实样本 Sunny row 868：LOCAL 专家的
+// actual_use type 为空、cost=0。
+func runExpertLocal(p *Panel, a *auth.Auth, expertID, fallbackName, fallbackVersion string) error {
+	e := upstream.MarketExpert{
+		ExpertID: expertID, ExpertType: "agent",
+		DisplayNameZH: fallbackName, ProfessionZH: fallbackName, Version: fallbackVersion,
+	}
+	if experts, err := p.cfg.Upstream.MarketExpertList(a, "agent"); err == nil {
+		for _, it := range experts {
+			if it.ExpertID == expertID {
+				e = it
+				break
+			}
+		}
+	}
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
+		return fmt.Errorf("召唤链: %w", err)
+	}
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, expertID)
+	if err != nil {
+		return fmt.Errorf("真实对话: %w", err)
+	}
+	events := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
+	for _, ev := range events {
+		if ev["eventCode"] == "agent_task_created" {
+			ev["has_expert"] = true
+			ev["expert_id"] = e.ExpertID
+			ev["expert_name"] = e.DisplayNameZH
+			ev["expert_industry_id"] = ""
+		}
+	}
+	events = append(events, upstream.DesktopExpertActualUseLocal(e, conv, req))
+	events[len(events)-1]["type"] = ""
+	events[len(events)-1]["cost"] = 0
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return fmt.Errorf("使用事件: %w", err)
+	}
+	return nil
+}
+
 // runExpertLighthouse 完成 Expert_lighthouse（体验「腾讯轻量云」专家）。
 // 2026-09-12 判据（真实样本 Sunny row 868）：与 expert_5 同构，但两处差异——
 // chat 链的 agent_task_created 需带 has_expert:true + expert_id（我们默认 false），
 // expert_actual_use 的 mode 为 "LOCAL"（非 craft）。id 固定为轻量云专家
 // ex_2cvvUZQhDyeJ；requestId 必须是真实 chat 的服务端 id。紫川/人杰2 实测点亮。
 func runExpertLighthouse(p *Panel, a *auth.Auth) (string, error) {
-	const lhID = "ex_2cvvUZQhDyeJ"
-	lh := upstream.MarketExpert{
-		ExpertID: lhID, ExpertType: "agent",
-		DisplayNameZH: "腾讯轻量云专家", ProfessionZH: "腾讯轻量云专家", Version: "1.0.2",
-	}
-	// 市场列表若命中真实条目则用其信息（version 等以服务端为准）。
-	if experts, err := p.cfg.Upstream.MarketExpertList(a, "agent"); err == nil {
-		for _, e := range experts {
-			if e.ExpertID == lhID {
-				lh = e
-				break
-			}
-		}
-	}
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(lh)...); err != nil {
-		return "", fmt.Errorf("召唤链: %w", err)
-	}
-	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, lhID)
-	if err != nil {
-		return "", fmt.Errorf("真实对话: %w", err)
-	}
-	events := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
-	for _, ev := range events {
-		if ev["eventCode"] == "agent_task_created" {
-			ev["has_expert"] = true
-			ev["expert_id"] = lh.ExpertID
-			ev["expert_name"] = lh.DisplayNameZH
-			ev["expert_industry_id"] = ""
-		}
-	}
-	events = append(events, upstream.DesktopExpertActualUseLocal(lh, conv, req))
-	// 对齐真实样本细节：轻量云专家 actual_use 的 type 为空、cost=0。
-	events[len(events)-1]["type"] = ""
-	events[len(events)-1]["cost"] = 0
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
-		return "", fmt.Errorf("使用事件: %w", err)
+	if err := runExpertLocal(p, a, "ex_2cvvUZQhDyeJ", "腾讯轻量云专家", "1.0.2"); err != nil {
+		return "", err
 	}
 	return "已上报轻量云专家召唤+使用链（真实对话 requestId）", nil
+}
+
+// runValorantExpert 完成 WorkBuddy_Valorant（体验「无畏契约拼豆专家」，issue #228）。
+// 与 Expert_lighthouse 同构：专家 ex_xQHHD1u5Jkua（agent_name=valorant-perler-expert，
+// v1.2.1），mode 沿用 LOCAL。该任务判据尚无真实样本，点亮未实测——若上游判据不同，
+// 表现为进度不动而非报错。
+func runValorantExpert(p *Panel, a *auth.Auth) (string, error) {
+	if err := runExpertLocal(p, a, "ex_xQHHD1u5Jkua", "无畏契约拼豆专家", "1.2.1"); err != nil {
+		return "", err
+	}
+	return "已上报无畏契约拼豆专家召唤+使用链（真实对话 requestId）", nil
 }
 
 // runAppearance 完成 Hp_Appearance（换主题）。

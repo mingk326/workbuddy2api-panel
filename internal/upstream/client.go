@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -952,6 +953,10 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //     复用新 token 返回，不再发第二次请求。
 //   - 锁内仅做「读 refreshToken 快照」与「校验未变后写回新 token」两小段内存操作；
 //   - 网络 I/O（doJSON）仍带 30s ctx 超时——避免上游 hang 时长时间占用刷新锁。
+//   - **跨进程兜底**：进程内单飞挡不住「另一进程（server + signin 双进程部署、
+//     cmd/login 手工刷新）已把同一 auth 文件的 RT rotate 过」这种竞态。此时刷新会
+//     撞 12153，但磁盘上的 RT 已是新的、可用的——读回磁盘 token 再试一次即可自愈，
+//     否则账号恒 401 只能人工重新登录。
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	// 单飞：先取代数快照，再拿账号级刷新锁；等待期间若别人已刷新完成则直接复用。
 	gen := a.RefreshGeneration()
@@ -960,7 +965,49 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if a.RefreshGeneration() != gen {
 		return nil
 	}
+	err := c.refreshTokenOnce(a)
+	if err != nil && isSessionDead(err) && adoptNewerTokensFromDisk(a) {
+		err = c.refreshTokenOnce(a)
+	}
+	return err
+}
 
+// isSessionDead 判定错误是否为上游 12153（会话 / RT 失效）。
+func isSessionDead(err error) bool {
+	var ue *Error
+	return errors.As(err, &ue) && ue.Kind == ErrSessionDead
+}
+
+// adoptNewerTokensFromDisk 在 refresh 失败后读回 auth 文件：若磁盘 RT 与内存不同
+// （另一进程已刷新并写回），采纳磁盘 token 并返回 true，供调用方重试一次。
+// 读文件失败、解析失败、RT 一致均返回 false（不改内存状态），保持失败语义。
+func adoptNewerTokensFromDisk(a *auth.Auth) bool {
+	if a.FilePath == "" {
+		return false
+	}
+	raw, err := os.ReadFile(a.FilePath)
+	if err != nil {
+		return false
+	}
+	disk, err := auth.Parse(raw)
+	if err != nil || strings.TrimSpace(disk.RefreshToken) == "" {
+		return false
+	}
+	a.Lock()
+	defer a.Unlock()
+	if disk.RefreshToken == a.RefreshToken {
+		return false
+	}
+	a.AccessToken = disk.AccessToken
+	a.RefreshToken = disk.RefreshToken
+	if disk.ExpiresAt > 0 {
+		a.ExpiresAt = disk.ExpiresAt
+	}
+	return true
+}
+
+// refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
+func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	// 第 1 段（锁内）：读快照。
 	a.Lock()
 	rtSnapshot := a.RefreshToken

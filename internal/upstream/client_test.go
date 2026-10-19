@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -293,6 +294,69 @@ func TestRefreshSerializedPerAccount(t *testing.T) {
 	}
 	if a.AccessToken != "at1" || a.RefreshToken != "rt1" {
 		t.Errorf("tokens not updated from single refresh: at=%s rt=%s", a.AccessToken, a.RefreshToken)
+	}
+}
+
+// TestRefreshAdoptsNewerTokensFromDisk 钉住跨进程兜底：另一进程（server + signin
+// 双进程部署、cmd/login 手工刷新）已把同一 auth 文件的 RT rotate 过时，本进程内存
+// 里的 RT 已是废票，刷新会撞 12153 —— 此时必须读回磁盘上的新 RT 再试一次自愈，
+// 而不是让账号恒 401 直到人工重新登录（issue #215 的跨进程分支）。
+func TestRefreshAdoptsNewerTokensFromDisk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workbuddy-test.json")
+	disk := &auth.Auth{AccessToken: "disk-at", RefreshToken: "disk-rt", ExpiresAt: 9999, FilePath: path}
+	if err := disk.SaveAtomic(); err != nil {
+		t.Fatalf("save disk auth: %v", err)
+	}
+	var calls atomic.Int32
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		if r.Header.Get("X-Refresh-Token") != "disk-rt" {
+			// 内存里的旧 RT 已被别的进程消费 → 上游判 12153 并作废整条链。
+			return &http.Response{
+				StatusCode: 401,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"code":12153,"msg":"Offline user session not found"}`)),
+			}, nil
+		}
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"at2","refreshToken":"rt2","expiresIn":3600}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "stale-at", RefreshToken: "stale-rt", ExpiresAt: 1, FilePath: path}
+
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh 应通过磁盘新 RT 自愈: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("refresh requests=%d want 2（首次 12153，采纳磁盘 RT 后重试一次）", got)
+	}
+	if a.AccessToken != "at2" || a.RefreshToken != "rt2" {
+		t.Errorf("tokens not updated: at=%s rt=%s", a.AccessToken, a.RefreshToken)
+	}
+}
+
+// TestRefreshNoRetryWhenDiskTokenUnchanged 反向钉住：磁盘 RT 与内存一致（真的是
+// 会话失效）时不得重试，否则把一次真失效刷成两次请求，白白多撞一次上游。
+func TestRefreshNoRetryWhenDiskTokenUnchanged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workbuddy-test.json")
+	disk := &auth.Auth{AccessToken: "same-at", RefreshToken: "same-rt", ExpiresAt: 9999, FilePath: path}
+	if err := disk.SaveAtomic(); err != nil {
+		t.Fatalf("save disk auth: %v", err)
+	}
+	var calls atomic.Int32
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: 401,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":12153,"msg":"Offline user session not found"}`)),
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "same-at", RefreshToken: "same-rt", ExpiresAt: 1, FilePath: path}
+
+	if err := c.RefreshToken(a); err == nil {
+		t.Fatal("want error")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("refresh requests=%d want 1（磁盘 RT 未变，不重试）", got)
 	}
 }
 
