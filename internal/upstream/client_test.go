@@ -104,6 +104,10 @@ func TestClassify(t *testing.T) {
 		{429, `{"error":{"data":{"code":6021,"msg":"queue.full.title"}}}`, ErrUpstreamBusy},
 		{429, `queue.full.title`, ErrUpstreamBusy},
 		{429, `{"code":6021,"msg":"queue full"}`, ErrUpstreamBusy},
+		// 6020「queue.waiting.title」渠道级排队（2026-10-18 实案）：同样不是账号问题。
+		{429, `{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":1026,"retry_after":40}}`, ErrUpstreamBusy},
+		{429, `queue.waiting.title`, ErrUpstreamBusy},
+		{500, `{"code":6020,"msg":"queue.waiting.title"}`, ErrUpstreamBusy},
 		// 文案外卡不绑 429（上游若换状态码仍须识别为渠道满载，不得落 hardMarkers 族）。
 		{500, `{"code":6021,"msg":"queue.full.title"}`, ErrUpstreamBusy},
 		// 防过宽：普通限流文案不带 queue.full，仍走软限流。

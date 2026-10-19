@@ -950,19 +950,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 6021「queue.full.title」渠道级容量满载：**不罚号不轮转**，立即透传
-			// 上游原文回客户端（503 + upstream_busy）。上游集群排队打满时换任何
-			// 账号都撞同一堵墙——按限流处置会逐号软冷却，实测 2 秒绞杀整池健康号
-			// （2026-10-15 实案），且换号白撞把无效请求放大 MaxRotate 倍。客户端
-			// 按 Retry-After 退避重试即可；等待窗口过去渠道恢复即成功。
+			// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/容量：
+			// **不罚号不轮转**，立即透传上游原文回客户端（503 + upstream_busy）。
+			// 上游集群排队时换任何账号都撞同一堵墙——按限流处置会逐号软冷却，实测
+			// 2 秒绞杀整池健康号（2026-10-15/18 实案），且换号白撞把无效请求放大
+			// MaxRotate 倍。客户端按 Retry-After 退避重试即可；等待窗口过去渠道恢复
+			// 即成功。6020 的 data.retry_after 是上游建议等待秒数，优先采用。
 			if kind == upstream.ErrUpstreamBusy {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
-					msg = "upstream capacity is full (queue.full); retry after a short wait"
+					msg = "upstream queue is busy (queue.waiting/queue.full); retry after a short wait"
 				}
-				w.Header().Set("Retry-After", "5")
+				retryAfter := 5
+				if d := upstream.QueueRetryAfter(string(respBody)); d > 0 {
+					retryAfter = int(d / time.Second)
+				}
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
 				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_busy", msg,
 					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusServiceUnavailable
@@ -1179,12 +1184,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
 			}
 		case upstream.ErrUpstreamBusy:
-			// 6021 queue.full 渠道级容量满载（防御路径：正常已在轮转循环内
-			// fail-fast 拦截）。503 + Retry-After + 可重试语义——上游原文
-			// （下方统一透传）含 requestId，客户端按退避重试即可。
+			// 6020 queue.waiting / 6021 queue.full 渠道级排队/容量（防御路径：正常
+			// 已在轮转循环内 fail-fast 拦截）。503 + Retry-After + 可重试语义——
+			// 上游原文（下方统一透传）含 requestId，客户端按退避重试即可。
 			code = "upstream_busy"
-			msg = "upstream capacity is full (queue.full); retry after a short wait"
-			w.Header().Set("Retry-After", "5")
+			msg = "upstream queue is busy (queue.waiting/queue.full); retry after a short wait"
+			retryAfter := 5
+			if d := upstream.QueueRetryAfter(ue.Msg); d > 0 {
+				retryAfter = int(d / time.Second)
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
 		case upstream.ErrModelBlocked:
 			// 11102「该后端无此模型」：上游原文（下方统一透传）已经写清了原因，但
 			// code 此前停在默认的 no_healthy_account —— 那是"服务端过载"的语义，

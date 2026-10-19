@@ -213,6 +213,50 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
+// TestChatQueueWaitingFailsFastWithoutPenalty 上游 429 + code 6020「queue.waiting.title」
+// 是渠道级排队（2026-10-18 实案：三个账号数秒内连续命中，按限流逐号软冷却 10 分钟，
+// 客户端最终 429）。端到端断言：不轮转、503 + upstream_busy、Retry-After 采用上游
+// data.retry_after（40s）、账号零惩罚。
+func TestChatQueueWaitingFailsFastWithoutPenalty(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 429, `{"code":6020,"msg":"queue.waiting.title","requestId":"3c46d1dadd7eec21ccbcabfad11d396f","data":{"queue_position":1026,"queue_size":"999+","retry_after":40,"estimated_wait":5130,"client_user_type":"free"}}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "busy1", AccessToken: "at-busy1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "busy2", AccessToken: "at-busy2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("busy1", 2000, 0)
+	p.SetCredits("busy2", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s (want 503: channel-level queue, client should back off)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 0 {
+		t.Errorf("calls=%v want busy1 1 次、busy2 0 次（零轮转）", calls)
+	}
+	st, _ := p.Status("busy1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("ErrUpstreamBusy must not penalize account: %+v", st)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "6020") || !strings.Contains(body, "queue.waiting.title") {
+		t.Errorf("503 message should carry upstream 6020 info: %s", body)
+	}
+	if !strings.Contains(body, "upstream_busy") {
+		t.Errorf("503 body should carry upstream_busy code: %s", body)
+	}
+	if strings.Contains(body, "no_healthy_account") {
+		t.Errorf("channel-queue failure must not be reported as account exhaustion: %s", body)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "40" {
+		t.Errorf("Retry-After=%q want 40 (upstream data.retry_after)", got)
+	}
+}
+
 // TestChatBadParams400CarriesUpstreamBody 11101 的 400 响应必须包含上游原始
 // 11101 信息（含 requestId，客户端据此排查），且不再出现空洞的 no_healthy_account。
 func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {

@@ -125,12 +125,32 @@ var softRateMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
-// isQueueFullBody 判定渠道级容量满载文案（6021 queue.full.title 家族）。
-// 该形态表明上游推理集群排队队列打满，与具体账号无关；换号在任何时刻都会撞
-// 同一堵墙，正确处置是不罚号不轮转（见 Classify 的 6021 分支）。子串口径但
-// 用完整固定文案（"queue.full"），避免与普通限流文案误撞。
-func isQueueFullBody(lower string) bool {
-	return strings.Contains(lower, "queue.full") || strings.Contains(lower, "queue full")
+// isQueueBusyBody 判定渠道级排队/容量文案（6020 queue.waiting / 6021 queue.full 家族）。
+// 该形态表明上游推理集群排队或满载，与具体账号无关；换号在任何时刻都会撞
+// 同一堵墙，正确处置是不罚号不轮转（见 Classify 的 6020/6021 分支）。子串口径但
+// 用完整固定文案（"queue.full" / "queue.waiting"），避免与普通限流文案误撞。
+func isQueueBusyBody(lower string) bool {
+	return strings.Contains(lower, "queue.full") || strings.Contains(lower, "queue full") ||
+		strings.Contains(lower, "queue.waiting") || strings.Contains(lower, "queue waiting")
+}
+
+// QueueRetryAfter 从 6020 / 6021 响应体解析上游建议的重试等待时长
+// （data.retry_after，单位秒）。仅用于 ErrUpstreamBusy 的 Retry-After 头；
+// 缺失、非法或超过 10 分钟时返回 0（调用方回落默认值）。
+func QueueRetryAfter(body string) time.Duration {
+	var env struct {
+		Data struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"data"`
+	}
+	if json.Unmarshal([]byte(body), &env) != nil || env.Data.RetryAfter <= 0 {
+		return 0
+	}
+	d := time.Duration(env.Data.RetryAfter) * time.Second
+	if d > 10*time.Minute {
+		return 0
+	}
+	return d
 }
 
 // accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
@@ -482,10 +502,10 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     不受影响。
 //  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（issue #175）。
 //     只认结构化业务码，不靠可能跨计费/限流两界的文案猜测。
-//  5. 429 + 6021 queue.full —— 渠道级容量满载（上游集群排队打满），归
-//     ErrUpstreamBusy：非账号问题，不罚号不轮转（2026-10-15 实案：按限流处置
-//     2 秒绞杀整池 DeepSeek 号）。判在 status==429 兜底**之前**——它是比
-//     「限流」更具体的渠道级信号（同 14018 的具体优先哲学）。
+//  5. 429 + 6020 queue.waiting / 6021 queue.full —— 渠道级排队或容量满载，
+//     归 ErrUpstreamBusy：非账号问题，不罚号不轮转（2026-10-15/18 实案：按限流
+//     处置会在秒级把整池健康号逐个冷却）。判在 status==429 兜底**之前**——它是
+//     比「限流」更具体的渠道级信号（同 14018 的具体优先哲学）。
 //  6. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
 //     "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把
 //     限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词
@@ -533,13 +553,13 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
 		return ErrHardCredit
 	}
-	// 6021「queue.full.title」是**渠道级容量满载**（上游推理集群排队队列打满），
-	// 不是账号问题：同一时刻换任何账号都会撞同一堵墙。必须先于通用 429 兜底，
+	// 6020「queue.waiting.title」/ 6021「queue.full.title」都是**渠道级排队/容量**
+	// 信号，不是账号问题：同一时刻换任何账号都会撞同一堵墙。必须先于通用 429 兜底，
 	// 否则会按 ErrSoftRate 逐号软冷却——实测 2 秒内即可把整池健康号全部误杀
-	// 冷却（2026-10-15 实案），且换号白撞放大请求量。429 + 结构化 code 为主判据
-	// （与 14018 同口径）；"queue.full" 固定文案单列为外卡——该文案是上游 i18n
-	// key 原文，语义唯一，非 429 状态码出现同样归本类（防上游换状态码）。
-	if (status == http.StatusTooManyRequests && hasBusinessCode(body, "6021")) || isQueueFullBody(lower) {
+	// 冷却（2026-10-15/18 实案），且换号白撞放大请求量。429 + 结构化 code 为主判据
+	// （与 14018 同口径）；"queue.full" / "queue.waiting" 固定文案单列为外卡——这些
+	// 文案是上游 i18n key 原文，语义唯一，非 429 状态码出现同样归本类（防上游换状态码）。
+	if (status == http.StatusTooManyRequests && (hasBusinessCode(body, "6021") || hasBusinessCode(body, "6020"))) || isQueueBusyBody(lower) {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
