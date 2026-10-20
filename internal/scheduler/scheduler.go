@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -23,8 +24,11 @@ import (
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
-	Pool           *pool.Pool
-	Upstream       *upstream.Client
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	// CreditHist 积分变动流水（nil = 不记账）。只在**真实查到**余额后 Observe，
+	// 不喂池内缓存值；首次观测只建基线不留痕。
+	CreditHist     *credithist.Ledger
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -519,21 +523,37 @@ func (s *Scheduler) RunCheckinNow() {
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
 		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if !a.IsEnterprise() {
-			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+		if a.SupportsPersonalEndpoints() {
+			// 先查活动状态（只读）：本机 checkin_done 只记录我们自己发起的签到，用户从
+			// 手机 / 官方客户端签过就看不到；上游 today_checked_in 才是权威事实。已签则
+			// 直接记账跳过（省掉 21:00 那一轮注定被幂等拒绝的写调用），顺带把连登与
+			// 活动截止落进日志；active=false 说明活动已结束/未开始，提前显形。
+			// **查询失败 fail-open**——照常签到（签到自身的幂等错误标记仍是兜底判据）。
+			label := logfmt.Label(st.UID, st.Nickname)
+			act, actErr := s.cfg.Upstream.GetCheckinActivityStatus(a)
+			switch {
+			case actErr != nil:
+				log.Printf("WARN: checkin %s: 活动状态查询失败（照常签到）: %v", label, actErr)
+			case !act.Active:
+				log.Printf("WARN: checkin %s: 上游签到活动当前不生效（截止 %s），仍尝试签到", label, act.EndTime)
+			}
+			if actErr == nil && act.TodayCheckedIn {
+				s.cfg.Pool.NoteCheckinDone(st.UID)
+				log.Printf("checkin %s: 上游显示今天已签到（连登 %d 天，活动至 %s）", label, act.StreakDays, act.EndTime)
+			} else if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 				if upstream.IsAlreadyCheckin(err) {
 					s.cfg.Pool.NoteCheckinDone(st.UID)
-					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
+					log.Printf("checkin %s: 今天已签到（幂等）", label)
 				} else {
-					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+					log.Printf("WARN: checkin %s: %v", label, err)
 				}
 				// 其余业务错误也继续走余额查询
 			} else {
 				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
 				// 重复触发时出现），成功也落一行。
 				s.cfg.Pool.NoteCheckinDone(st.UID)
-				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+				log.Printf("checkin %s: 签到成功", label)
 			}
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
@@ -544,6 +564,7 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
 		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+		s.cfg.CreditHist.Observe(st.UID, remain)
 	}
 	s.RunStreakBonusNow()
 }
@@ -577,7 +598,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——这两者对企业号都是 403
 		// （「growth system is only available for personal users」），即**零收益**。
 		// 该类"静默无效"最易被忽略（日志无异常），故显式跳过，不给上游多发一次请求。
-		if a.IsEnterprise() {
+		if !a.SupportsPersonalGrowth() {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -685,6 +706,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			}
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+			s.cfg.CreditHist.Observe(uid, remain)
 		}(a, st.UID)
 	}
 	wg.Wait()

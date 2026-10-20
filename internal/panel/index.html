@@ -465,6 +465,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pk-card .who { display: flex; align-items: baseline; gap: 7px; margin-bottom: 7px; }
   .pk-card .nm { font-weight: 600; font-size: 13px; }
   .pk-card .realm { font-size: 11px; color: var(--ink-3); font-family: var(--mono); }
+  .pk-card .pk-plan { font-size: 10.5px; padding: 0 5px; border-radius: 4px; line-height: 16px;
+    color: var(--ink-2); background: var(--line-soft); white-space: nowrap; }
   .pk-card .big { font: 600 24px/1.1 var(--mono); font-variant-numeric: tabular-nums; }
   .pk-card .sub { font-size: 11.5px; color: var(--ink-3); margin-top: 3px; }
   .pk-card .mixbar { display: flex; height: 7px; border-radius: 4px; overflow: hidden;
@@ -890,6 +892,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </table>
         </div>
       </div>
+
+      <div class="box">
+        <header>
+          <h3>积分变动流水</h3>
+          <span class="grow"></span>
+          <span class="note" id="chNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc zebra">
+            <thead><tr><th>时间</th><th>账号</th><th class="num">变动</th>
+              <th class="num">变动前</th><th class="num">变动后</th></tr></thead>
+            <tbody id="chBody"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <!-- 配置 -->
@@ -1068,6 +1085,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">需重启</span></label>
             </div>
             <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">默认思考档位</span>
+                <select name="thinking_default_effort">
+                  <option value="">留空 = 关闭（尊重客户端与模型默认）</option>
+                  <option value="off">off</option>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                  <option value="max">max</option>
+                </select>
+                <span class="hint">客户端未显式带档位时注入 reasoning_effort；显式档位不覆盖；立即生效</span></label>
+            </div>
+            <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
@@ -1094,6 +1126,58 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button type="submit" class="primary" id="btnCfgSave">保存配置</button>
         </div>
       </form>
+
+      <!-- 多密钥与按密钥思考档位（独立于上方整份配置表单） -->
+      <div class="box">
+        <header><h3>API 密钥与思考档位</h3><span class="grow"></span>
+          <span class="note" id="keysNote">—</span>
+          <button type="button" class="xs" id="btnKeyAdd">新增密钥</button></header>
+        <div class="tbl-wrap">
+          <table class="acc zebra">
+            <thead><tr><th>名称</th><th>密钥</th><th>面板权限</th>
+              <th>默认档位</th><th>模型覆盖</th><th class="num">操作</th></tr></thead>
+            <tbody id="keysBody"></tbody>
+          </table>
+        </div>
+        <div class="pad" id="keyForm" hidden>
+          <div class="grid3">
+            <label class="fld"><span class="lb">名称</span>
+              <input id="keyName" placeholder="例如：codex / trae" autocomplete="off"></label>
+            <label class="fld"><span class="lb">密钥</span>
+              <input id="keySecret" placeholder="留空 = 自动生成" autocomplete="off">
+              <span class="hint" id="keySecretHint">创建后完整密钥只显示一次</span></label>
+            <label class="fld"><span class="lb">默认思考档位</span>
+              <select id="keyEffort">
+                <option value="">留空 = 跟随全局</option>
+                <option value="off">off</option>
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+                <option value="max">max</option>
+              </select></label>
+          </div>
+          <div class="grid2">
+            <label class="fld"><span class="lb">按模型覆盖（JSON）</span>
+              <input id="keyPerModel" placeholder='{"deepseek-v4.1-flash":"max"}'>
+              <span class="hint">键为裸模型名（不带 cn:/global: 前缀）；优先于默认档位</span></label>
+            <div class="switch" style="align-self:end"><span class="lb">管理员（可进面板）</span>
+              <input type="checkbox" id="keyAdmin"></div>
+          </div>
+          <div class="inline" style="justify-content:flex-end">
+            <button type="button" id="btnKeyCancel">取消</button>
+            <button type="button" class="primary" id="btnKeySave">保存密钥</button>
+          </div>
+        </div>
+        <div class="pad" id="keyReveal" hidden>
+          <div class="hint">新密钥（仅本次显示，请立即复制保存）：<code id="keyRevealVal"></code></div>
+        </div>
+        <div class="pad">
+          <div class="hint">优先级：客户端显式档位 &gt; 密钥「按模型」&gt; 密钥「默认」&gt; 全局 thinking.* &gt; 模型默认。
+            普通密钥只能调用 <code>/v1/*</code>；<b>管理员</b>密钥才能进入本面板。旧版 <code>api_key</code> 恒为管理员，只读展示。</div>
+        </div>
+      </div>
     </section>
 
     <!-- 日志 -->

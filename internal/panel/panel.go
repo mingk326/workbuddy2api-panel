@@ -4,8 +4,9 @@
 //
 // 设计约束：
 //   - 前端 go:embed 单文件（index.html），无任何外部构建依赖，与二进制同体部署；
-//   - 鉴权复用网关 api_key（Bearer），与 /v1/* 同一口径；api_key 为空 = 不鉴权
-//     （仅本机/私网使用）。面板 HTML 本身无秘密，可匿名加载，密钥只发给 /panel/api/*；
+//   - 鉴权与 /v1/* 共用密钥表（Bearer），但面板只接受 **admin** 密钥；密钥表为空
+//     = 不鉴权（仅本机/私网使用）。面板 HTML 本身无秘密，可匿名加载，密钥只发给
+//     /panel/api/*；
 //   - 不改写既有池语义：所有运维操作落到 pool 已有入口（Revive/Disable/Remove...），
 //     添加账号走 auth.SaveAtomic + pool.Add，重启后与 auths/ 目录天然对齐。
 package panel
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -60,6 +62,9 @@ type Config struct {
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
+	// CreditHist 积分变动流水（nil = /panel/api/credit_history 返回 501）。
+	// 手工刷新 / 签到时也会追加流水，与 scheduler 共用同一账本。
+	CreditHist *credithist.Ledger
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -90,6 +95,10 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// keyMu 密钥 CRUD 的读-改-写串行化：配置页保存与密钥增删改可能并发，
+	// 不串行会把彼此刚写入的字段覆盖回旧值。
+	keyMu sync.Mutex
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -155,13 +164,21 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("GET /panel/api/error_summary", p.withAuth(p.errorSummary))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/models/busy", p.withAuth(p.modelBusy))
+	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
+	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensation))
+	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	// 静态 API Key 账号（ck_/pt_ 前缀）：无需 OAuth 设备流，直接落盘进池。
+	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.withAuth(p.addAPIKey))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
@@ -190,6 +207,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	// API 密钥管理（多密钥体系）：仅 admin 密钥可访问（withAuth 已强制）。
+	p.mux.HandleFunc("GET /panel/api/keys", p.withAuth(p.keysList))
+	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keysCreate))
+	p.mux.HandleFunc("POST /panel/api/keys/update", p.withAuth(p.keysUpdate))
+	p.mux.HandleFunc("POST /panel/api/keys/delete", p.withAuth(p.keysDelete))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -199,12 +221,15 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
 }
 
-// withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
-// api_key 为空时放行。密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求
-// 即用新值（无需重启）。
+// withAuth 面板鉴权：**仅 admin 密钥**可访问（网关 /v1/* 不受此限）。
+//
+// 密钥表为空（未启用鉴权）时放行；普通密钥即便有效也回 401 而不是 403——
+// 403 会告诉持有者"这把密钥是真的、只是权限不够"，等于给暴力猜测送确认信号。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		keys := p.keyTable()
+		key, ok := httpauth.Authenticate(r, keys)
+		if !ok || (len(keys) > 0 && !key.Admin) {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}
@@ -212,13 +237,19 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// apiKey 当前生效密钥（Live 优先，回落静态字段）。
-func (p *Panel) apiKey() string {
+// keyTable 当前生效密钥表（Live 优先；无 Live 时把静态字段合成为 admin 身份）。
+func (p *Panel) keyTable() []httpauth.Key {
 	if p.cfg.Live != nil {
-		return p.cfg.Live.Load().APIKey
+		return p.cfg.Live.Load().Keys()
 	}
-	return p.cfg.APIKey
+	if p.cfg.APIKey == "" {
+		return nil
+	}
+	return []httpauth.Key{{ID: "legacy", Secret: p.cfg.APIKey, Name: "api_key", Admin: true}}
 }
+
+// authRequired 是否启用鉴权（密钥表非空）。
+func (p *Panel) authRequired() bool { return len(p.keyTable()) > 0 }
 
 // expiringSoonWindow 返回调度器当前生效的快过期路由窗口；测试面板无调度器时返回 0。
 func (p *Panel) expiringSoonWindow() time.Duration {
@@ -244,7 +275,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
+		"auth_required":   p.authRequired(),
 		"redis_mode":      p.cfg.RedisMode,
 		"sticky_sessions": sticky,
 		"total":           total,
@@ -263,6 +294,21 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+}
+
+// errorSummary 把日志环里的 WARN/ERR 按「账号 × 类型」聚合（见 errors.go）。
+// 与日志同源、零新增存储：环里有几行就聚合几行。
+func (p *Panel) errorSummary(w http.ResponseWriter, r *http.Request) {
+	entries := p.logs.Snapshot()
+	lines := make([]LogLine, 0, len(entries))
+	for _, e := range entries {
+		lines = append(lines, LogLine{Text: e.Text, TS: e.TS})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rows":       AggregateErrors(lines),
+		"scanned":    len(entries),
+		"updated_at": time.Now().Format("15:04:05"),
+	})
 }
 
 // requestMetrics 返回进程内请求指标、最近 100 条与归档状态。
@@ -312,6 +358,67 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 		rows = []reqlog.Event{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
+}
+
+// creditHistory 返回积分变动流水（新的在前）；limit 默认 200、上限 1000。
+// uid 非空时只返回该账号的流水（面板账号详情页用）。流水只在真实查到余额
+// 且与上次不同时追加，首次观测只建立基线，不会把历史余额误报成"刚获得"。
+// 账号昵称在读取时用池快照填充——账本只存 uid，上游改名后旧流水也跟着更新。
+func (p *Panel) creditHistory(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.CreditHist == nil {
+		writeErr(w, http.StatusNotImplemented, "credit history not available")
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	uid := strings.TrimSpace(r.URL.Query().Get("uid"))
+	nicks := p.nicknames()
+	// 有 uid 过滤时必须先全量取回（账本上限默认 2000 条）：先截断再过滤会让
+	// 筛选后的条数看起来像历史缺失。无过滤时只取 limit 条。
+	readLimit := limit
+	if uid != "" {
+		readLimit = 0
+	}
+	rows := p.cfg.CreditHist.Read(readLimit)
+	out := make([]map[string]any, 0, limit)
+	for _, e := range rows {
+		if uid != "" && e.UID != uid {
+			continue
+		}
+		out = append(out, map[string]any{
+			"time":    e.Time,
+			"uid":     e.UID,
+			"account": nicks[e.UID],
+			"delta":   e.Delta,
+			"before":  e.Before,
+			"after":   e.After,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": out, "limit": limit})
+}
+
+// nicknames 池内 uid → 昵称映射（仅展示用，不含任何凭证）。
+func (p *Panel) nicknames() map[string]string {
+	nicks := map[string]string{}
+	if p.cfg.Pool == nil {
+		return nicks
+	}
+	for _, st := range p.cfg.Pool.List() {
+		if st.Nickname != "" {
+			nicks[st.UID] = st.Nickname
+		}
+	}
+	return nicks
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
@@ -366,6 +473,70 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// modelBusy 查询模型繁忙度（上游 /v2/chat/busy，只读观测，不参与选号）。
+//
+// 查询参数：
+//   - realm：cn（缺省）/ global —— 决定用哪一域的账号与模型目录；
+//   - models：逗号分隔的模型名（可带 realm: 前缀）。缺省时自动拉该域目录。
+//
+// 上游对同一批模型可能返回 unknown（服务端当次无数据），前端不得把它当"不可用"。
+func (p *Panel) modelBusy(w http.ResponseWriter, r *http.Request) {
+	realm := r.URL.Query().Get("realm")
+	if realm == "" {
+		realm = "cn"
+	}
+	if realm != "cn" && realm != "global" {
+		writeErr(w, http.StatusBadRequest, "realm 只能是 cn 或 global")
+		return
+	}
+	var ids []string
+	for _, raw := range strings.Split(r.URL.Query().Get("models"), ",") {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		// 剥掉 realm: 前缀——上游只认裸名。
+		if i := strings.Index(id, ":"); i > 0 {
+			id = id[i+1:]
+		}
+		ids = append(ids, id)
+	}
+
+	uids := p.cfg.Pool.AvailableUIDsForRealm(realm)
+	if len(uids) == 0 {
+		writeErr(w, http.StatusServiceUnavailable, "该域没有可用账号")
+		return
+	}
+	acct := p.cfg.Pool.AuthByUID(uids[0])
+	if acct == nil {
+		writeErr(w, http.StatusServiceUnavailable, "账号未加载")
+		return
+	}
+	if len(ids) == 0 {
+		if realm == "cn" {
+			if infos, err := p.cfg.Upstream.FetchModels(acct); err == nil {
+				for _, mi := range infos {
+					ids = append(ids, mi.ID)
+				}
+			}
+		} else {
+			for _, mi := range p.cfg.Upstream.FetchGlobalModelInfos(acct) {
+				ids = append(ids, mi.ID)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		writeErr(w, http.StatusBadGateway, "取不到模型列表")
+		return
+	}
+	levels, err := p.cfg.Upstream.ModelBusy(acct, ids)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "查询繁忙度失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "realm": realm, "busy": levels})
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
@@ -521,11 +692,15 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
-	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
-	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
-	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
-		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+	// 企业版 / 静态 API Key 无签到体系（企业版上游 400 code 10001「企业账号不支持
+	// 该操作」；Key 账号没有个人身份）：不发起该调用，端点退化为「刷新额度」。
+	// 前端对这两类账号不渲染「签到」按钮；此处是 API 侧防御。
+	if !a.SupportsPersonalGrowth() {
+		if a.IsAPIKey() {
+			checkinMsg = "API Key 账号无签到体系（已跳过签到，仅刷新额度）"
+		} else {
+			checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+		}
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
 		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
@@ -541,6 +716,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}
+	if a.IsAPIKey() {
+		resp["api_key"] = true
+	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
@@ -552,6 +730,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
 	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+	p.cfg.CreditHist.Observe(uid, remain)
 	resp["credits"] = remain
 	resp["credits_total"] = total
 	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
@@ -572,6 +751,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+	p.cfg.CreditHist.Observe(uid, remain)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 
@@ -809,7 +989,11 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 		Remain   int64                    `json:"remain"`
 		Size     int64                    `json:"size"`
 		Packages []upstream.CreditPackage `json:"packages"`
-		Error    string                   `json:"error,omitempty"`
+		// Plan/PlanEvidence 套餐分类（见 pool.ClassifyPlan）：由包名派生，无包时 unknown。
+		// 运维据此一眼看出「该指望哪个号」：免费版最容易撞 6004，活动号积分用完就没了。
+		Plan         pool.PlanKind `json:"plan"`
+		PlanEvidence string        `json:"plan_evidence,omitempty"`
+		Error        string        `json:"error,omitempty"`
 	}
 	out := make([]row, len(accts))
 
@@ -838,6 +1022,11 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			it.Packages = packs
 			it.Remain = remain
 			it.Size = size
+			names := make([]string, 0, len(packs))
+			for _, pk := range packs {
+				names = append(names, pk.Name)
+			}
+			it.Plan, it.PlanEvidence = pool.ClassifyPlan(names)
 			out[i] = it
 		}(i, s)
 	}

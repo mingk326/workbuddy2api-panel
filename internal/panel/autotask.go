@@ -639,6 +639,14 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	// 无个人成长体系的账号直接拒绝：企业版成长端点上游 403（「growth system is only
+	// available for personal users」）；静态 API Key 账号（ck_/pt_）根本没有个人
+	// 账号身份。两者执行任何成长任务都是零收益白跑。
+	if !a.SupportsPersonalGrowth() {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"该账号无个人成长体系（企业版或静态 API Key）；请改用个人账号")
+		return
+	}
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
@@ -1275,6 +1283,12 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
+		return
+	}
+	// 无个人成长体系的账号直接拒绝（企业版 / 静态 API Key），与单任务入口同口径。
+	if !a.SupportsPersonalGrowth() {
+		writeErr(w, http.StatusUnprocessableEntity,
+			"该账号无个人成长体系（企业版或静态 API Key）；请改用个人账号")
 		return
 	}
 	// per-account 互斥（与单任务动作共用一把锁）：重复点击 409。

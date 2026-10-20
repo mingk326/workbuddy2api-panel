@@ -1,6 +1,18 @@
 {
   "listen": ":7863",
   "api_key": "test_key",
+  "api_keys": [
+    {
+      "id": "codex",
+      "key": "sk-codex-example",
+      "name": "Codex",
+      "admin": false,
+      "thinking_default_effort": "high",
+      "thinking_per_model": {
+        "deepseek-v4.1-flash": "max"
+      }
+    }
+  ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
@@ -18,6 +30,33 @@
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"
+  },
+  "budget": {
+    "daily_credit_limit": 0,
+    "burst_credit_limit": 0,
+    "cache_low_rate": 0
+  },
+  "metrics": {
+    "enabled": false
+  },
+  "thinking": {
+    "default_effort": "",
+    "per_model": {}
+  },
+  "admin": {
+    "enabled": false,
+    "audit_enabled": false,
+    "audit_file": "data/admin-audit.jsonl"
+  },
+  "alerting": {
+    "enabled": false,
+    "webhook_url": "",
+    "secret": "",
+    "interval_seconds": 30,
+    "min_healthy_cn": 0,
+    "min_healthy_global": 0,
+    "breaker_threshold": 0,
+    "send_resolve": true
   },
   "schedule": {
     "checkin_hours": [9, 21],

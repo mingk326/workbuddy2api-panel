@@ -796,9 +796,12 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	}
 }
 
-// TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
-// （现状不变）。
-func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
+// TestChat6004WithoutResetStaysModelLevel 6004 无时间文案 → **仍按模型级**停车：
+// 只写 modelCooldowns[model]（有界退避 TTL），不动账号级 until，换模型立即可用。
+//
+// 旧行为是「无重置时间就退回账号级软冷却」，等于把「一个模型忙」放大成「整个账号
+// 不可用」——几个并发请求就能把整池冷掉（线上事故：76 秒内冷掉整池 → 全站 503）。
+func TestChat6004WithoutResetStaysModelLevel(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
@@ -821,15 +824,53 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling: %+v", st)
+	if st.Cooling {
+		t.Fatalf("6004 无重置时间也不得按账号冷却: %+v", st)
 	}
-	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
-	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
-		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("rate-limited models=%+v, want 单行 glm-5.3", st.RateLimitedModels)
 	}
-	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" || st.RateLimitedModels[0].Kind != "rate_limit" {
-		t.Fatalf("rate-limited models=%+v, want audit row for glm-5.3", st.RateLimitedModels)
+	// 换模型必须仍能选中该账号（模型豁免）。
+	if diff := p.PickExcludingForModel(nil, "hy3-x"); diff == nil || diff.UID != "bad" {
+		t.Fatalf("换模型应仍可选中 bad，got %+v", diff)
+	}
+	// 同模型必须避开该账号。
+	if same := p.PickExcludingForModel(nil, "glm-5.3"); same != nil && same.UID == "bad" {
+		t.Fatalf("同模型不应再选到 bad: %+v", same)
+	}
+}
+
+// TestChat14003TreatedAsModelLevel 14003「当前模型请求繁忙」属模型级限流：
+// 只停 (账号, 模型)，不冷却整个账号。上游文案本身就是「请切换模型或稍后重试」。
+func TestChat14003TreatedAsModelLevel(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":14003,"msg":"too many requests","displayMsg":"模型繁忙，请换模型或稍后"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if st.Cooling {
+		t.Fatalf("14003 是模型级，不得冷却整个账号: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("rate-limited models=%+v, want 单行 glm-5.3", st.RateLimitedModels)
+	}
+	if diff := p.PickExcludingForModel(nil, "hy3-x"); diff == nil || diff.UID != "bad" {
+		t.Fatalf("14003 后换模型应仍可选中该账号，got %+v", diff)
 	}
 }
 

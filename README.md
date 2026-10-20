@@ -355,7 +355,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
-| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_key` | 空 | 旧版单一密钥；非空时**恒为管理员**（可进面板），与 `api_keys` 并存。空 = 不鉴权直接放行（公网必须设置） |
+| `api_keys` | `[]` | 多密钥表（1.14.0+）：`{id, key, name, admin, thinking_default_effort, thinking_per_model}`。`admin=true` 才能进面板；每把密钥可单独配置默认思考档与按模型覆盖。至少保留一把管理员密钥，密钥/ID 不可重复 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
@@ -376,6 +377,20 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
 | `schedule.blackcat_enabled` | `true` | 夜猫子总开关 |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
+| `schedule.task_sweep_enabled` | `true` | 任务补领清扫：周期扫描成长任务的「已达标未领」并幂等 accept/claim（不跑行为链路） |
+| `schedule.task_sweep_minutes` | `15` | 补领清扫周期（分钟） |
+| `budget.daily_credit_limit` | `0` | 当日累计积分上限（CST 自然日，按上游 `usage.credit` 观测值累计）；`0` = 关闭 |
+| `budget.burst_credit_limit` | `0` | 5 分钟窗口积分上限（止血高倍率模型）；`0` = 关闭 |
+| `budget.cache_low_rate` | `0` | 连续 5 轮缓存命中率低于该百分比 → 冷却 60s；`0` = 关闭 |
+| `metrics.enabled` | `false` | 注册 `GET /metrics`（Prometheus 文本，`wb2api_*`；与 `/v1/*` 同 api_key 鉴权） |
+| `alerting.enabled` | `false` | Webhook 阈值告警（健康账号数 / 熔断 / WAF）；可选 HMAC-SHA256 签名 |
+| `alerting.webhook_url` / `secret` | 空 | 告警接收地址与签名密钥（`X-WB2A-Signature`） |
+| `alerting.min_healthy_cn` / `min_healthy_global` | `0` | 健康账号低于该值即告警；`0` = 不启用该规则 |
+| `admin.enabled` | `false` | 注册 `POST /admin/tasks/{name}/run`（手动补跑排程，**admin 密钥**鉴权；未启用鉴权时放行） |
+| `admin.audit_enabled` / `audit_file` | `false` / 空 | /admin 操作追加 JSONL 审计（路径不可写启动报错） |
+| `thinking.default_effort` | 空 | 网关默认思考档（off/minimal/low/medium/high/xhigh/max）：客户端请求**未显式**带档位时注入出站 `reasoning_effort`，Claude Code / Codex 等客户端无需各自配置；显式档位与 `thinking:disabled` 一律尊重不覆盖。空 = 关闭 |
+| `thinking.per_model` | `{}` | 按裸模型名覆盖默认档（如 `{"deepseek-v4.1-flash":"xhigh"}`）；未命中回落 `default_effort` |
+| 密钥级档位 | 空 | `api_keys[].thinking_default_effort` / `thinking_per_model` 覆盖全局 `thinking.*`。完整优先级：客户端显式 > 密钥按模型 > 密钥默认 > 全局按模型 > 全局默认 > 模型默认。注意 `max`/`xhigh` 会占用较多输出预算，客户端 `max_tokens` 过小（如 <1024）可能出现「只有思考、没有正文」 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
@@ -627,7 +642,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 http://127.0.0.1:7863/panel/
 ```
 
-鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
+鉴权与 API 共用密钥表，但**只有管理员密钥**（`admin=true`，旧版 `api_key` 恒为管理员）能进入面板：浏览器输入一次密钥后记住（localStorage）；密钥表为空则直接可用。普通密钥调用面板接口一律 401，不泄露「密钥有效但权限不足」。
 界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航七个视图：
 
 | 视图 | 功能 |
@@ -637,7 +652,7 @@ http://127.0.0.1:7863/panel/
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
-| **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
+| **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 默认思考档 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关）；下方**API 密钥与思考档位**表支持新增 / 编辑 / 删除多把密钥（每把可设管理员权限、默认档位与按模型覆盖，创建后完整密钥只显示一次） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动 |
 
 顶部另有「刷新」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
@@ -665,14 +680,15 @@ http://127.0.0.1:7863/panel/
 
 ### 面板接口（`/panel/api/*`）
 
-与页面同一 Bearer 鉴权，可直接脚本化调用：
+与页面同一 Bearer 鉴权（**仅 admin 密钥**；密钥表为空时放行），可直接脚本化调用：
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
-| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET models/busy`（`realm` / `models`）· `GET model_probes` · `GET logs` · `GET error_summary` · `GET credit_history`（`limit` / `uid`）· `GET compensation` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove` · `compensation`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` · `compensation_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
-| 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
+| 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` · `POST accounts/add_apikey`（静态 Key `ck_`/`pt_`） |
+| 密钥管理 | `GET keys`（脱敏清单）· `POST keys`（新建，完整密钥仅本次回显）· `POST keys/update` · `POST keys/delete`（禁止删到一把不剩 / 删掉最后一把 admin） |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
@@ -688,11 +704,17 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/responses` | Bearer | Codex Responses 协议适配（转 chat_completions；`response.*` 事件族、`reasoning_summary_*`、截断 `response.incomplete`） |
+| `POST /v1/messages`（`/messages`） | `x-api-key` / Bearer | Anthropic Messages 协议适配（`message_start` / `content_block_*` / `message_delta`）；客户端声明 `web_search` 时由网关代执行检索 |
+| `POST /v1/images/generations` · `/v1/images/edits` | Bearer | 图像生成/编辑（CN `hunyuan-image-alpha`、global `gpt-image-2.5-sunburst`） |
+| `POST /v1/search` | Bearer | 官方 agenttool 联网检索（snippet；`deep=true` 走综述式 agentic_search） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
+| `GET /metrics` | Bearer | Prometheus 文本指标（`wb2api_*`；`metrics.enabled`，缺省关闭） |
+| `POST /admin/tasks/{name}/run` | **admin** Bearer | 手动补跑排程（`admin.enabled`，缺省关闭；`name` = `checkin` / `activity` / `keepalive` / `travel` / `blackcat` / `growth`） |
 
-> 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+> 鉴权规则：密钥表（`api_keys` + 旧版 `api_key`）非空时校验 `Authorization: Bearer <key>`，任意有效密钥都能调用 `/v1/*`；`/admin/*` 与面板要求 **admin** 密钥。密钥表为空时上述端点直接放行；`/healthz` 恒无鉴权。
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 

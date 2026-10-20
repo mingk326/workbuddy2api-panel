@@ -29,8 +29,8 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		if a.IsEnterprise() {
-			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
+		if !a.SupportsPersonalGrowth() {
+			continue // 企业版 / 静态 API Key 门控：无成长体系
 		}
 		s.streakBonusAccount(a)
 	}
@@ -40,13 +40,11 @@ func (s *Scheduler) RunStreakBonusNow() {
 func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
 	s.makeupYesterday(a)
-	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
-	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
-	}
-	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
-	}
+	// 0.5 礼包/补偿（每号一次）：**先查状态再领**（实现见 compensation_exec.go）——
+	// 盲领时「无活动 / 已领过」上游仍返回 code 0 且无 credit 字段，日志里会打成
+	// 假的「+0c」成功行，而真失败（401/5xx）反倒无痕；补偿带截止日，静默失败就会过期。
+	s.claimGiftQuiet(a)
+	s.claimCompensationQuiet(a)
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil {

@@ -355,7 +355,7 @@ function go(v) {
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
-  if (v === 'config') loadConfig();
+  if (v === 'config') { loadConfig(); loadKeys(); }
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
@@ -438,7 +438,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + (s.api_key ? ' <span class="realm-tag">API Key</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -451,17 +451,17 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
-        // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
-        // upstream 的 get-enterprise-user-usage 口径填充。
-        (s.enterprise ? '' :
+        // 企业版 / 静态 API Key 无个人成长体系（签到 400「企业账号不支持该操作」/
+        // 成长任务 403）：不渲染「签到」「任务」按钮，只留「额度」——点它走
+        // /balance，额度由 upstream 的企业口径端点填充。
+        ((s.enterprise || s.api_key) ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
-        (s.enterprise ? '' :
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : (s.api_key ? ' title="刷新 API Key 账号额度（上游 get-enterprise-user-usage）"' : '')) + '>' + ((s.enterprise || s.api_key) ? '额度' : '余额') + '</button>' +
+        ((s.enterprise || s.api_key) ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + ((s.enterprise || s.api_key) ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
@@ -662,6 +662,7 @@ async function loadModels() {
     const hit = mdAll.filter(m => mdProbeOf(m.id)).length;
     $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
     renderModels();
+    refreshModelBusy(); // 观测增强：异步补繁忙度，失败不影响列表
   } catch (e) {
     mdAll = [];
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
@@ -726,6 +727,27 @@ function mdSortList(list, f) {
   return out;
 }
 
+/* 模型繁忙度（上游 /v2/chat/busy）：只读观测，不参与选号。
+   上游对同一批模型可能返回 unknown（服务端当次无数据），故只展示
+   busy / congested / unavailable 三档，其余一律不标——不把"取不到"当"不可用"。 */
+let mdBusy = {};
+const MD_BUSY_LABELS = { busy: '繁忙', congested: '拥堵', unavailable: '不可用' };
+function mdBusyOf(id) {
+  const bare = String(id || '').includes(':') ? String(id).split(':').slice(1).join(':') : String(id || '');
+  return mdBusy[bare] || '';
+}
+async function refreshModelBusy() {
+  const next = {};
+  for (const realm of ['cn', 'global']) {
+    try {
+      const d = await api('models/busy?realm=' + realm);
+      Object.assign(next, d.busy || {});
+    } catch (e) { /* 观测失败不影响模型列表 */ }
+  }
+  mdBusy = next;
+  if (mdAll.length) renderModels();
+}
+
 // mdRowHtml 单个模型行（纯渲染，便于独立测试）。
 function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
@@ -738,6 +760,8 @@ function mdRowHtml(m, pr) {
   if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
   if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+  const busyLevel = mdBusyOf(m.id);
+  if (MD_BUSY_LABELS[busyLevel]) caps.push('<span class="tag warn">' + MD_BUSY_LABELS[busyLevel] + '</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
   return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
@@ -1009,6 +1033,7 @@ const CFG_MAP = {
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
+  thinking_default_effort: ['thinking', 'default_effort'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
@@ -1023,7 +1048,7 @@ const CFG_MAP = {
  * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'thinking_default_effort']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -1123,9 +1148,115 @@ $('cfgForm').onsubmit = async ev => {
     const k = $('cfgKey').value.trim();
     if (k) localStorage.setItem(LS_KEY, k);
     loadConfig();
+    loadKeys(); // api_key 可能已改，密钥列表里的 legacy 条目要跟着刷新
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
+};
+
+/* ── API 密钥与思考档位 ─────────────────────────────────────────────
+ * 独立于上方整份配置表单：只维护 api_keys 数组，经 /panel/api/keys 增删改；
+ * 旧版 config.api_key 以 legacy 身份只读展示（恒为管理员）。 */
+let editingKeyID = '';
+
+function effortText(v) { return v ? esc(v) : '<span class="hint">跟随全局</span>'; }
+
+async function loadKeys() {
+  const tb = $('keysBody');
+  try {
+    const d = await api('keys');
+    const keys = d.keys || [];
+    $('keysNote').textContent = d.auth_required ? keys.length + ' 把密钥' : '未启用鉴权';
+    if (!keys.length) {
+      tb.innerHTML = '<tr><td colspan="6"><div class="empty"><div class="big">尚未配置密钥</div>当前网关无需鉴权；新增一把管理员密钥即可开启鉴权</div></td></tr>';
+      return;
+    }
+    tb.innerHTML = keys.map(k => {
+      const ops = k.legacy ? '<span class="hint">只读</span>'
+        : '<button class="xs" data-kid="' + esc(k.id) + '" data-act="edit">编辑</button> ' +
+          '<button class="xs" data-kid="' + esc(k.id) + '" data-act="del">删除</button>';
+      const pm = k.thinking_per_model || {};
+      const per = Object.keys(pm).length
+        ? Object.keys(pm).map(m => esc(m) + ' → ' + esc(pm[m])).join('<br>')
+        : '—';
+      return '<tr><td>' + esc(k.name || '—') + (k.legacy ? ' <span class="hint">（旧版）</span>' : '') + '</td>' +
+        '<td><code>' + esc(k.masked) + '</code></td>' +
+        '<td>' + (k.admin ? '管理员' : '普通') + '</td>' +
+        '<td>' + effortText(k.thinking_default_effort) + '</td>' +
+        '<td>' + per + '</td>' +
+        '<td class="num">' + ops + '</td></tr>';
+    }).join('');
+    tb.querySelectorAll('button[data-act]').forEach(b => {
+      b.onclick = () => {
+        const k = keys.find(x => x.id === b.dataset.kid);
+        if (!k) return;
+        if (b.dataset.act === 'edit') openKeyForm(k); else delKey(k);
+      };
+    });
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="6">读取失败：' + esc(e.message) + '</td></tr>';
+  }
+}
+
+function openKeyForm(k) {
+  editingKeyID = k ? k.id : '';
+  $('keyForm').hidden = false;
+  $('keyReveal').hidden = true;
+  $('keyName').value = k ? (k.name || '') : '';
+  $('keySecret').value = '';
+  $('keySecret').disabled = !!k;
+  $('keySecret').placeholder = k ? '编辑模式不可改密钥' : '留空 = 自动生成';
+  $('keySecretHint').textContent = k ? '如需更换密钥，请删除后重建' : '创建后完整密钥只显示一次';
+  $('keyEffort').value = k ? (k.thinking_default_effort || '') : '';
+  $('keyPerModel').value = k && k.thinking_per_model ? JSON.stringify(k.thinking_per_model) : '';
+  $('keyAdmin').checked = k ? !!k.admin : false;
+}
+
+async function delKey(k) {
+  if (!confirm('删除密钥「' + (k.name || k.id) + '」？使用它的客户端会立即失效。')) return;
+  try {
+    await api('keys/delete', { method: 'POST', body: JSON.stringify({ id: k.id }) });
+    toast('密钥已删除', 'ok');
+    loadKeys();
+  } catch (e) { toast('删除失败：' + e.message, 'err'); }
+}
+
+$('btnKeyAdd').onclick = () => openKeyForm(null);
+$('btnKeyCancel').onclick = () => { $('keyForm').hidden = true; editingKeyID = ''; };
+$('btnKeySave').onclick = async () => {
+  let per = {};
+  const raw = $('keyPerModel').value.trim();
+  if (raw) {
+    try { per = JSON.parse(raw); } catch { return toast('「按模型覆盖」不是合法 JSON', 'err'); }
+    if (typeof per !== 'object' || per === null || Array.isArray(per)) {
+      return toast('「按模型覆盖」必须是 {"模型名":"档位"} 形式的对象', 'err');
+    }
+  }
+  const body = {
+    name: $('keyName').value.trim(),
+    admin: $('keyAdmin').checked,
+    thinking_default_effort: $('keyEffort').value,
+    thinking_per_model: per,
+  };
+  const btn = $('btnKeySave');
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    if (editingKeyID) {
+      body.id = editingKeyID;
+      await api('keys/update', { method: 'POST', body: JSON.stringify(body) });
+      toast('密钥已保存并立即生效', 'ok');
+    } else {
+      body.key = $('keySecret').value.trim();
+      const r = await api('keys', { method: 'POST', body: JSON.stringify(body) });
+      $('keyRevealVal').textContent = r.key;
+      $('keyReveal').hidden = false;
+      toast('密钥已创建，请立即复制保存', 'ok');
+    }
+    $('keyForm').hidden = true;
+    editingKeyID = '';
+    loadKeys();
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '保存密钥'; }
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
@@ -2358,6 +2489,43 @@ async function loadUsage() {
     $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
     $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
   }
+  loadCreditHistory();
+}
+
+/* 积分变动流水：只在「真实查到的余额」与上次不同时留痕（签到 / 活跃上报 /
+   猫猫旅行 / 成长任务 / 上游扣费都会体现在这里）。首次观测只建基线不留痕，
+   因此升级后第一轮刷新不会把历史余额误报成「刚获得」。 */
+function chTimeText(t) {
+  if (!t) return '—';
+  return new Date(t).toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour12: false,
+    month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+async function loadCreditHistory() {
+  if (!$('chBody')) return;
+  try {
+    const d = await api('credit_history?limit=200');
+    const names = new Map(((overviewData && overviewData.accounts) || [])
+      .map(a => [String(a.uid), a.nickname || a.uid]));
+    const rows = d.entries || [];
+    $('chNote').textContent = rows.length ? rows.length + ' 条（最新在前）' : '暂无流水';
+    $('chBody').innerHTML = rows.length ? rows.map(e => {
+      const delta = Number(e.delta || 0);
+      const sign = delta > 0 ? '+' : '';
+      return '<tr><td>' + chTimeText(e.time) + '</td>' +
+        '<td>' + esc(e.account || names.get(String(e.uid)) || e.uid) + '</td>' +
+        '<td class="num ' + (delta > 0 ? 'c-ok' : (delta < 0 ? 'c-warn' : '')) + '">' +
+        sign + fmtTok(Math.abs(delta)) + '</td>' +
+        '<td class="num">' + fmtTok(e.before) + '</td>' +
+        '<td class="num">' + fmtTok(e.after) + '</td></tr>';
+    }).join('') : '<tr><td colspan="5" class="empty">暂无积分变动流水</td></tr>';
+  } catch (e) {
+    $('chNote').textContent = '—';
+    $('chBody').innerHTML = '<tr><td colspan="5" class="empty">读取失败：' + esc(e.message) + '</td></tr>';
+  }
 }
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
@@ -2602,6 +2770,14 @@ function renderExpiryDistribution(list, now) {
     '<div class="pk-expiry-foot">' + esc(foot) + '</div>';
 }
 
+// 套餐标签（后端 pool.ClassifyPlan 判定，unknown 不显示）：一眼看出该指望哪个号。
+const PLAN_LABELS = { free: '免费版', trial: '体验版', activity: '活动号', standard: '标准版' };
+function planTag(a) {
+  const label = PLAN_LABELS[a.plan];
+  return label ? '<span class="pk-plan" title="' + esc(a.plan_evidence || label) + '">' +
+    esc(label) + '</span>' : '';
+}
+
 function renderPackages(d, detailLimit) {
   const list = (d.accounts || []);
   const now = Date.now();
@@ -2634,7 +2810,7 @@ function renderPackages(d, detailLimit) {
   $('pkSummary').innerHTML = list.map(a => {
     if (a.error) {
       return '<div class="pk-card"><div class="who"><span class="nm">' +
-        esc((a.nickname || a.uid.slice(0, 8))) + '</span>' +
+        esc((a.nickname || a.uid.slice(0, 8))) + '</span>' + planTag(a) +
         '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
         '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
     }
@@ -2663,6 +2839,7 @@ function renderPackages(d, detailLimit) {
       }).join('') + '</div>' : '';
     return '<div class="pk-card">' +
       '<div class="who"><span class="nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+      planTag(a) +
       '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
       '<div class="big">' + fmtTok(a.remain) + '</div>' +
       '<div class="sub">共 ' + fmtTok(a.size) + ' · ' + (a.packages || []).length +

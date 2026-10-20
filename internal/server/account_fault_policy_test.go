@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,52 @@ func TestApplyErrorPolicyRequestIllegalCooldownsNotDisables(t *testing.T) {
 	}
 	if st.CoolRemaining <= 0 {
 		t.Fatalf("cool_remaining_sec=%d, want > 0", st.CoolRemaining)
+	}
+}
+
+// 同一文案 "request illegal" 下，11140（账号级授权风控，需申诉）与 11-128
+// （渠道校验拦截，请求级可重试）必须分开处置：前者硬禁用并提示申诉，后者软冷却。
+// 把两者合并成「都软冷却」会让 11140 的号每轮冷却到期后被反复选中试错；
+// 合并成「都禁用」则会误杀仍可用的 11-128 账号（issue #197）。
+func TestApplyErrorPolicyRequestIllegalSplitsByCode(t *testing.T) {
+	body11140 := `{"code":11140,"msg":"request illegal"}`
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+	h.applyErrorPolicy("u1", upstream.ErrAccountFault, body11140, "", nil)
+
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("11140 是账号级授权风控，应禁用并提示申诉: %+v", st)
+	}
+	if !strings.Contains(st.DisabledReason, "appeal") {
+		t.Errorf("disabled_reason=%q 应提示去官方申诉", st.DisabledReason)
+	}
+
+	// 嵌套信封（error.data.code）同样要识别。
+	p2 := pool.New("")
+	p2.Add(&auth.Auth{UID: "u2"})
+	h2 := NewHandler(Config{Pool: p2, SoftCooldown: 600 * time.Second})
+	h2.applyErrorPolicy("u2", upstream.ErrAccountFault,
+		`{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, "", nil)
+	if st2, _ := p2.Status("u2"); !st2.Disabled {
+		t.Fatalf("嵌套信封里的 11140 也应禁用: %+v", st2)
+	}
+}
+
+// 信封里没有可辨识 code 时宁可软冷却也不误杀账号。
+func TestApplyErrorPolicyRequestIllegalUnknownCodeStaysSoft(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+	h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"msg":"request illegal"}`, "", nil)
+
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Fatalf("无可辨识 code 时不得禁用账号: %+v", st)
+	}
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("应软冷却: %+v", st)
 	}
 }
 

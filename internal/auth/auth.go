@@ -243,6 +243,45 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
+// isAPIKeyToken 静态 API Key 判据：CodeBuddy 平台签发的 ck_/pt_ 前缀。
+// 只看前缀：落盘形态不持久化 tokenType（静态 Key 无法 refresh），前缀是跨进程
+// 唯一稳定的判据。独立成无锁函数，供已持 a.mu 的调用方复用（NeedsRefresh）。
+func isAPIKeyToken(token string) bool {
+	return strings.HasPrefix(token, "ck_") || strings.HasPrefix(token, "pt_")
+}
+
+// IsAPIKey 报告账号是否为静态 API Key（ck_/pt_ 前缀）。
+// 该类账号无 refreshToken / expiresAt，不参与 token 刷新与个人成长体系。
+func (a *Auth) IsAPIKey() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return isAPIKeyToken(a.AccessToken)
+}
+
+// UsesEnterpriseBilling 报告账号的额度查询是否该走企业口径端点
+// （/v2/billing/meter/get-enterprise-user-usage）。
+//
+// 企业版与静态 API Key 账号同属此列：个人 get-user-resource 对二者均返回空
+// Accounts（企业账号无个人资源包；静态 Key 无个人账号身份），额度必须走企业口径，
+// 否则余额恒为 0 → 积分保底把可用号当成耗尽号挡掉。
+func (a *Auth) UsesEnterpriseBilling() bool { return a.IsEnterprise() || a.IsAPIKey() }
+
+// SupportsPersonalGrowth 报告账号是否具备个人成长体系（签到 / 成长任务 / 连登管家 /
+// 猫猫旅行 / 夜猫子）。企业版与静态 API Key 都没有该体系：
+//   - 企业版：上游一律拒绝（400 code 10001 / 403 growth-only，见 IsEnterprise）；
+//   - 静态 API Key：根本没有个人账号身份。
+//
+// scheduler 各任务与 panel 成长入口统一用本方法门控，避免对注定失败的端点空发请求、
+// 把本可正常对话的号攒出一串上游报错。
+func (a *Auth) SupportsPersonalGrowth() bool { return !a.IsEnterprise() && !a.IsAPIKey() }
+
+// SupportsPersonalEndpoints 报告账号是否可调用「签到 / 任务列表」这类显式报错的个人端点。
+// 与 SupportsPersonalGrowth（执行类门控）刻意分开命名：两者当前判据相同，但语义不同。
+func (a *Auth) SupportsPersonalEndpoints() bool { return !a.IsEnterprise() && !a.IsAPIKey() }
+
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {
@@ -251,9 +290,17 @@ func isGlobalDomain(d string) bool {
 }
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
+// 静态 API Key（ck_/pt_）无过期概念、也永远无法 refresh（refresh 端点只认 OAuth
+// 设备流），故恒返回 false——否则每个请求前都会打一次必然失败的 refresh。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
+	if a == nil {
+		return false
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if isAPIKeyToken(a.AccessToken) {
+		return false
+	}
 	if a.ExpiresAt <= 0 {
 		return true
 	}

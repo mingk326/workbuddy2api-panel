@@ -70,16 +70,19 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// budget 积分闸（可选）：请求出口把观测到的 credit / 缓存率喂给它。
+	budget *dailyBudget
+
 	logged bool
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
-func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
+func newChatStat(now time.Time, body []byte, stream bool, budget *dailyBudget) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, budget: budget}
 }
 
 // done 幂等落一行表格日志。
@@ -88,8 +91,14 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
+	total := time.Since(s.start)
+	logChatRowEx(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks,
 		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+	// 积分闸只吃**观测到的**值：credit 缺失不按 0 计（否则会把闸门当"免费"放行），
+	// 缓存字段缺失不参与命中率判定（模型不报缓存 ≠ 零命中）。
+	s.budget.add(s.credit, s.hasCredit)
+	s.budget.observeCache(s.cacheHit, s.cacheMiss, s.hasCache)
+	noteProm(s, total)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，

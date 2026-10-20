@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -31,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.6-panel"
+const appVersion = "1.14.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -132,6 +133,9 @@ func main() {
 	}
 
 	up := upstream.New()
+	// 网关默认思考档注入（thinking.*）：出站管线在 PrepareBodyOpt 之后、prompt_cache_key
+	// 之前注入；显式客户端档位/显式关闭尊重不覆盖（见 upstream.InjectDefaultThinkingEffort）。
+	up.SetThinkingOverride(cfg.Thinking.DefaultEffort, cfg.Thinking.PerModel)
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
@@ -169,10 +173,14 @@ func main() {
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
+	// 积分变动流水：与 state 文件同目录（重启后余额基线不丢，避免把上次余额当新增）。
+	// scheduler 与面板共用一个账本，手工刷新/签到与后台刷新写入同一条时间线。
+	creditHist := credithist.New(stateSibling(cfg.StateFile, "credit-history.json"), 0)
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
+		CreditHist:     creditHist,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
@@ -234,6 +242,7 @@ func main() {
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
+		APIKeys:              cfg.EffectiveKeys(),
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
@@ -266,6 +275,7 @@ func main() {
 		Pool:        p,
 		Usage:       rec,
 		RequestLog:  requestLog,
+		CreditHist:  creditHist,
 		Upstream:    up,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
@@ -301,6 +311,17 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
+	// /admin 审计（缺省关闭）：路径不可写直接退出——运维端点无审计比不开更危险。
+	var auditLog *server.AuditLog
+	if cfg.Admin.AuditEnabled {
+		al, aerr := server.NewAuditLog(cfg.Admin.AuditFile, cfg.APIKey)
+		if aerr != nil {
+			log.Fatalf("admin audit: %v", aerr)
+		}
+		auditLog = al
+		log.Printf("admin audit: %s", al.Path())
+	}
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -320,6 +341,14 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 积分闸（0 = 关闭）：当日上限 / 5 分钟突发 / 连续低缓存率。
+		BudgetLimit:        cfg.Budget.DailyCreditLimit,
+		BudgetBurstLimit:   cfg.Budget.BurstCreditLimit,
+		BudgetCacheLowRate: cfg.Budget.CacheLowRate,
+		MetricsEnabled:     cfg.Metrics.Enabled,
+		AdminEnabled:       cfg.Admin.Enabled,
+		Tasks:              sch,
+		Audit:              auditLog,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -327,6 +356,11 @@ func main() {
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 账号池可用性告警（旁路）：启用且有 webhook 才启动。
+	if mon := newAlertMonitor(cfg, p, h); mon != nil {
+		log.Printf("账号池告警已启用：webhook=%s", cfg.Alerting.WebhookURL)
+		go mon.Run(ctx)
+	}
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -492,11 +526,19 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
+		APIKeys:              newCfg.EffectiveKeys(),
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+
+		BudgetDailyCreditLimit: newCfg.Budget.DailyCreditLimit,
+		BudgetBurstCreditLimit: newCfg.Budget.BurstCreditLimit,
+		BudgetCacheLowRate:     newCfg.Budget.CacheLowRate,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	// thinking.* 热生效（与 sanitize 同一层：出站管线读的是 livecfg 快照之外的 Client 字段，
+	// 但 thinking 注入在 prepareBody 里按次读取，此处同步即可立即生效）。
+	up.SetThinkingOverride(newCfg.Thinking.DefaultEffort, newCfg.Thinking.PerModel)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

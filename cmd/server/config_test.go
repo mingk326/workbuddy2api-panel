@@ -859,3 +859,74 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// TestAPIKeysLegacyCompat 老配置只有 api_key：运行期密钥表里以 legacy 身份出现，
+// 恒为管理员，面板与网关都能继续用同一把密钥。
+func TestAPIKeysLegacyCompat(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"api_key":"sk-legacy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := c.EffectiveKeys()
+	if len(keys) != 1 || keys[0].ID != "legacy" || !keys[0].Admin || keys[0].Secret != "sk-legacy" {
+		t.Fatalf("effective keys = %+v", keys)
+	}
+}
+
+// TestAPIKeysNormalize 多密钥归一化：自动 id、档位小写、per-model 校验。
+func TestAPIKeysNormalize(t *testing.T) {
+	c, err := ParseConfig([]byte(`{
+		"api_key":"sk-legacy",
+		"api_keys":[
+			{"key":"sk-admin-new","admin":true,"name":" 主密钥 ","thinking_default_effort":"MAX"},
+			{"key":"sk-codex","thinking_per_model":{"glm-5.2":"LOW","kimi-k3":"xhigh"}}
+		]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.APIKeys) != 2 {
+		t.Fatalf("api_keys len=%d", len(c.APIKeys))
+	}
+	k := c.APIKeys[0]
+	if k.ID == "" || k.Name != "主密钥" || !k.Admin || k.DefaultEffort != "max" {
+		t.Errorf("entry0=%+v", k)
+	}
+	if got := c.APIKeys[1].PerModel["glm-5.2"]; got != "low" {
+		t.Errorf("per_model glm-5.2=%q want low", got)
+	}
+	keys := c.EffectiveKeys()
+	if len(keys) != 3 || keys[2].ID != "legacy" {
+		t.Fatalf("effective keys len=%d (%+v)", len(keys), keys)
+	}
+	if c.APIKeys[0].ID == c.APIKeys[1].ID {
+		t.Error("自动生成的 id 不应重复")
+	}
+}
+
+// TestAPIKeysRequireAdmin 有密钥但没有管理员 → 启动报错（防止面板被锁死）。
+func TestAPIKeysRequireAdmin(t *testing.T) {
+	if _, err := ParseConfig([]byte(`{"api_keys":[{"key":"sk-only","admin":false}]}`)); err == nil {
+		t.Fatal("want error when no admin key")
+	}
+	// 旧版 api_key 恒为 admin，可以兜住。
+	if _, err := ParseConfig([]byte(`{"api_key":"sk-legacy","api_keys":[{"key":"sk-only"}]}`)); err != nil {
+		t.Fatalf("legacy api_key should satisfy admin requirement: %v", err)
+	}
+}
+
+// TestAPIKeysRejectDuplicate 重复密钥 / 重复 id / 非法档位一律 fail fast。
+func TestAPIKeysRejectDuplicate(t *testing.T) {
+	cases := []string{
+		`{"api_keys":[{"key":"sk-a","admin":true},{"key":"sk-a"}]}`,
+		`{"api_keys":[{"id":"x","key":"sk-a","admin":true},{"id":"x","key":"sk-b"}]}`,
+		`{"api_keys":[{"key":"sk-a","admin":true,"thinking_default_effort":"ultra"}]}`,
+		`{"api_keys":[{"key":"sk-a","admin":true,"thinking_per_model":{"glm":"bogus"}}]}`,
+		`{"api_key":"sk-a","api_keys":[{"key":"sk-a","admin":true}]}`,
+	}
+	for _, raw := range cases {
+		if _, err := ParseConfig([]byte(raw)); err == nil {
+			t.Errorf("want error for %s", raw)
+		}
+	}
+}

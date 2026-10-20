@@ -23,6 +23,7 @@
 package upstream
 
 import (
+	"encoding/json"
 	"strings"
 )
 
@@ -201,4 +202,65 @@ func ensureDeepSeekEffort(obj map[string]any, defaultEffort string) {
 		defaultEffort = defaultDeepSeekEffort
 	}
 	obj["reasoning_effort"] = defaultEffort
+}
+
+// InjectDefaultThinkingEffort 网关侧默认思考档注入（config thinking.*，出站管线）。
+//   - 只在请求**未显式**携带 reasoning_effort / reasoningEffort / thinking.type=disabled
+//     时注入；显式档位/显式关闭一律尊重，不覆盖。
+//   - 档位按模型 supportedEfforts 降级（复用 normalizeReasoningEffort 同口径），
+//     模型不支持所配档位时落到 ≤该档位的最高支持档（不出站非法档）。
+//   - 注入走 snake 字段（reasoning_effort），与 thinking.go 既有默认档注入一致。
+//   - 模型名可能带 cn:/global: 前缀（网关路由协议），匹配前剥掉（上游只认裸名）。
+//
+// override 为 nil（关闭）时零改动；非 nil 时含全局键 ""（兜底档）。
+func InjectDefaultThinkingEffort(body []byte, override map[string]string) []byte {
+	if len(override) == 0 {
+		return body
+	}
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) != nil {
+		return body
+	}
+	// 显式客户端档位（任一形态）→ 零改动（尊重客户端意图）。
+	if _, has := obj["reasoning_effort"]; has {
+		return body
+	}
+	if _, has := obj["reasoningEffort"]; has {
+		return body
+	}
+	if th, ok := obj["thinking"].(map[string]any); ok {
+		if strings.EqualFold(strings.TrimSpace(anyToString(th["type"])), "disabled") {
+			return body
+		}
+	}
+	model, _ := obj["model"].(string)
+	if model == "" {
+		return body
+	}
+	bare := model
+	if i := strings.Index(model, ":"); i > 0 {
+		bare = model[i+1:]
+	}
+	effort, ok := override[bare]
+	if !ok || strings.TrimSpace(effort) == "" {
+		// 该模型未配置（或配了空档）→ 全局兜底；全局也没有才放弃。
+		effort, ok = override[""]
+		if !ok || strings.TrimSpace(effort) == "" {
+			return body
+		}
+	}
+	obj["reasoning_effort"] = effort
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// anyToString 把任意 JSON 值兜底转 string（thinking.type 畸形时按无显式关闭处理）。
+func anyToString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }

@@ -3,7 +3,9 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,15 +14,34 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
+// APIKeyEntry 多密钥体系中的一把密钥（config.api_keys 数组元素）。
+//
+// 设计要点：
+//   - Admin 才可访问管理面板；网关 /v1/* 所有密钥一视同仁。
+//   - DefaultEffort / PerModel 是该密钥专属的默认思考档，优先级高于全局
+//     thinking.*，但低于客户端显式档位（见 server 侧注入顺序）。
+//   - 旧版单一 api_key 继续有效且恒为管理员（EffectiveKeys 里以 legacy 身份出现），
+//     老配置零迁移成本。
+type APIKeyEntry struct {
+	ID            string            `json:"id"`                                // 稳定标识（面板 CRUD 用；空则按密钥摘要自动生成）
+	Key           string            `json:"key"`                               // 密钥本体
+	Name          string            `json:"name,omitempty"`                    // 备注名
+	Admin         bool              `json:"admin,omitempty"`                   // 是否可进管理面板
+	DefaultEffort string            `json:"thinking_default_effort,omitempty"` // 该密钥默认思考档
+	PerModel      map[string]string `json:"thinking_per_model,omitempty"`      // 该密钥按模型覆盖档位
+}
+
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen    string        `json:"listen"`             // ":7863"
+	APIKey    string        `json:"api_key"`            // 旧版单一密钥；非空时恒为管理员（向后兼容）
+	APIKeys   []APIKeyEntry `json:"api_keys,omitempty"` // 多密钥表
+	AuthDir   string        `json:"auth_dir"`           // ./auths
+	StateFile string        `json:"state_file"`         // ./data/state.json
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -62,6 +83,47 @@ type Config struct {
 		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
 		SoftRateMax string `json:"soft_rate_max"` // "2h"
 	} `json:"cooldown"`
+
+	// Budget 积分闸（budget.go）。三道闸互相独立，0 = 关闭对应闸（缺省全关，
+	// 对老配置零影响）。只累计上游**观测到的** usage.credit，按 CST 自然日归零。
+	Budget struct {
+		// DailyCreditLimit 当日累计 credit 上限。到顶后 chat 请求 429
+		// daily_budget_exceeded，次日 00:00（CST）自动归零。
+		DailyCreditLimit float64 `json:"daily_credit_limit"`
+		// BurstCreditLimit 5 分钟窗口内累计 credit 达到此值即拒（credit_guard_tripped）。
+		// 用途：hy4-preview 这类高倍率模型一次对话 20+ 积分，日上限止血太慢。
+		BurstCreditLimit float64 `json:"burst_credit_limit"`
+		// CacheLowRate 连续 5 轮缓存命中率低于该百分比（0-100）→ 冷却 60s。
+		// 用途：前缀缓存未命中时按全量计费，等于偷偷放大成本。
+		CacheLowRate float64 `json:"cache_low_rate"`
+	} `json:"budget"`
+
+	// Metrics Prometheus 指标端点（GET /metrics，走 api_key 鉴权）。缺省关闭。
+	Metrics struct {
+		Enabled bool `json:"enabled"`
+	} `json:"metrics"`
+
+	// Admin 手动补跑排程任务（POST /admin/tasks/{name}/run，走 api_key 鉴权）。
+	// 缺省关闭：该端点能触发真实上游请求（签到/保活/成长任务），只在运维需要时打开。
+	// AuditEnabled 为 true 时每次 /admin 操作追加一行 JSONL（AuditFile 为空则报错退出）。
+	Admin struct {
+		Enabled      bool   `json:"enabled"`
+		AuditEnabled bool   `json:"audit_enabled"`
+		AuditFile    string `json:"audit_file"`
+	} `json:"admin"`
+
+	// Alerting 账号池可用性阈值告警（internal/alert）。缺省关闭。
+	// 事件以 JSON POST 到 webhook，可选 HMAC-SHA256 签名（X-WB2A-Signature）。
+	Alerting struct {
+		Enabled          bool   `json:"enabled"`
+		WebhookURL       string `json:"webhook_url"`
+		Secret           string `json:"secret"`
+		IntervalSeconds  int    `json:"interval_seconds"`   // 缺省 30
+		MinHealthyCN     int    `json:"min_healthy_cn"`     // 0 = 不启用该规则
+		MinHealthyGlobal int    `json:"min_healthy_global"` // 0 = 不启用该规则
+		BreakerThreshold int    `json:"breaker_threshold"`  // 0 = 不启用该规则
+		SendResolve      bool   `json:"send_resolve"`       // 恢复时是否发 resolve
+	} `json:"alerting"`
 
 	Schedule struct {
 		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
@@ -158,6 +220,16 @@ type Config struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
+
+	// Thinking 默认思考档位（出站注入）：空 = 不改写（与旧行为一致，尊重客户端显式档位
+	// 与模型默认档）。合法值：off/minimal/low/medium/high/xhigh/max（或上游接受的同义词）；
+	// 非法值启动校验报错（fail fast，避免悄悄回落导致行为不可预期）。
+	Thinking struct {
+		// DefaultEffort 全局默认思考档（models.effort 的跨模型兜底）。
+		DefaultEffort string `json:"default_effort"`
+		// PerModel 按裸模型名覆盖全局默认（如 {"deepseek-v4.1-flash":"high"}）。
+		PerModel map[string]string `json:"per_model"`
+	} `json:"thinking"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -609,7 +681,144 @@ func (c *Config) normalize() error {
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
+	if err := c.normalizeThinking(); err != nil {
+		return err
+	}
+	if err := c.normalizeAPIKeys(); err != nil {
+		return err
+	}
 	return c.normalizePrompt()
+}
+
+// thinkingEffortRank 档位词表（小写）。与 upstream/payload.go 的 effortRank 同口径。
+var thinkingEffortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+
+// normalizeThinking 归一化 thinking.default_effort / thinking.per_model：小写、去空白、
+// 非法档位 fail fast（不写盘/不启动，避免悄悄回落导致行为不可预期）。
+func (c *Config) normalizeThinking() error {
+	c.Thinking.DefaultEffort = strings.ToLower(strings.TrimSpace(c.Thinking.DefaultEffort))
+	if c.Thinking.DefaultEffort != "" {
+		if _, ok := thinkingEffortRank[c.Thinking.DefaultEffort]; !ok {
+			return fmt.Errorf("thinking.default_effort: %q 不是合法档位（off/minimal/low/medium/high/xhigh/max）", c.Thinking.DefaultEffort)
+		}
+	}
+	var err error
+	if c.Thinking.PerModel, err = normalizePerModel("thinking.per_model", c.Thinking.PerModel); err != nil {
+		return err
+	}
+	return nil
+}
+
+// normalizePerModel 归一化 per-model 档位表：键去空白、值小写，非法档位 fail fast。
+func normalizePerModel(field string, in map[string]string) (map[string]string, error) {
+	if len(in) == 0 {
+		return in, nil
+	}
+	merged := make(map[string]string, len(in))
+	for k, v := range in {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		val := strings.ToLower(strings.TrimSpace(v))
+		if val == "" {
+			continue
+		}
+		if _, ok := thinkingEffortRank[val]; !ok {
+			return nil, fmt.Errorf("%s[%q]: %q 不是合法档位（off/minimal/low/medium/high/xhigh/max）", field, k, v)
+		}
+		merged[key] = val
+	}
+	return merged, nil
+}
+
+// normalizeAPIKeys 校验并归一化多密钥表。
+//
+// 规则：
+//   - 每条密钥必须有非空 key；id 空则按密钥摘要自动生成，重复 id / 重复密钥报错；
+//   - 思考档位与全局 thinking.* 同词表、同口径（小写 + fail fast）；
+//   - 只要存在任何密钥（含旧版 api_key），必须至少有一把 admin——否则面板会被
+//     自己锁死在门外。
+func (c *Config) normalizeAPIKeys() error {
+	seenID := map[string]bool{}
+	// 旧版 api_key 参与去重：它同样是一把可用密钥。
+	seenKey := map[string]bool{}
+	if c.APIKey != "" {
+		seenKey[c.APIKey] = true
+	}
+	out := make([]APIKeyEntry, 0, len(c.APIKeys))
+	anyAdmin := c.APIKey != ""
+	for i := range c.APIKeys {
+		k := c.APIKeys[i]
+		k.ID = strings.TrimSpace(k.ID)
+		k.Key = strings.TrimSpace(k.Key)
+		k.Name = strings.TrimSpace(k.Name)
+		k.DefaultEffort = strings.ToLower(strings.TrimSpace(k.DefaultEffort))
+		if k.Key == "" {
+			return fmt.Errorf("api_keys[%d]: key 不能为空", i)
+		}
+		if k.ID == "" {
+			k.ID = "key-" + shortKeyHash(k.Key)
+		}
+		if k.ID == "legacy" {
+			return fmt.Errorf("api_keys: id \"legacy\" 为旧版 api_key 保留标识，请换一个")
+		}
+		if seenID[k.ID] {
+			return fmt.Errorf("api_keys: id %q 重复", k.ID)
+		}
+		seenID[k.ID] = true
+		if seenKey[k.Key] {
+			return fmt.Errorf("api_keys: 密钥重复（id=%s），每把密钥必须唯一", k.ID)
+		}
+		seenKey[k.Key] = true
+		if k.DefaultEffort != "" {
+			if _, ok := thinkingEffortRank[k.DefaultEffort]; !ok {
+				return fmt.Errorf("api_keys[id=%s].thinking_default_effort: %q 不是合法档位", k.ID, k.DefaultEffort)
+			}
+		}
+		var err error
+		if k.PerModel, err = normalizePerModel("api_keys[id="+k.ID+"].thinking_per_model", k.PerModel); err != nil {
+			return err
+		}
+		anyAdmin = anyAdmin || k.Admin
+		out = append(out, k)
+	}
+	c.APIKeys = out
+	if (len(c.APIKeys) > 0 || c.APIKey != "") && !anyAdmin {
+		return fmt.Errorf("api_keys: 至少需要一把管理员密钥（admin=true），否则管理面板将无法登录")
+	}
+	return nil
+}
+
+// EffectiveKeys 把配置转换为运行期密钥表：api_keys 各条 + 旧版 api_key（恒为 admin）。
+// 返回的 PerModel 与配置共享底层 map，调用方只读；livecfg.Store 会做深拷贝。
+func (c *Config) EffectiveKeys() []httpauth.Key {
+	out := make([]httpauth.Key, 0, len(c.APIKeys)+1)
+	for _, k := range c.APIKeys {
+		out = append(out, httpauth.Key{
+			ID:            k.ID,
+			Secret:        k.Key,
+			Name:          k.Name,
+			Admin:         k.Admin,
+			DefaultEffort: k.DefaultEffort,
+			PerModel:      k.PerModel,
+		})
+	}
+	if c.APIKey != "" {
+		out = append(out, httpauth.Key{
+			ID:     "legacy",
+			Secret: c.APIKey,
+			Name:   "旧版 api_key",
+			Admin:  true,
+		})
+	}
+	return out
+}
+
+// shortKeyHash 返回密钥摘要前 8 个十六进制字符（自动生成 id 用；不可逆）。
+func shortKeyHash(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

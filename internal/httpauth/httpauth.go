@@ -15,6 +15,55 @@ import (
 // bearerPrefix 认证方案前缀（大小写敏感，与 HTTP 规范及既有实现一致）。
 const bearerPrefix = "Bearer "
 
+// Key 一把 API 密钥及其身份（多密钥体系）。
+//
+// 除密钥本体外还承载两类身份信息：
+//   - Admin 是否可访问管理面板（/panel/api/*）；网关 /v1/* 不限。
+//   - DefaultEffort / PerModel 该密钥专属的默认思考档注入表（可为空）。
+//
+// 零值 Key 表示"未启用鉴权"（密钥表为空时的放行身份）。
+type Key struct {
+	ID            string
+	Secret        string
+	Name          string
+	Admin         bool
+	DefaultEffort string
+	PerModel      map[string]string
+}
+
+// Authenticate 在密钥表中查找请求携带的 Bearer 密钥，返回命中的身份。
+//
+// 语义与 VerifyBearer 对齐：keys 为空 = 未启用鉴权，返回零值 Key 且 ok=true。
+// 比较仍是 SHA-256 摘要 + subtle.ConstantTimeCompare，且**遍历全表不提前返回**：
+// 命中位置不同会改变循环次数，提前 break 等于把"第几把密钥"通过耗时泄露出去。
+func Authenticate(r *http.Request, keys []Key) (Key, bool) {
+	if len(keys) == 0 {
+		return Key{}, true
+	}
+	tok := bearerToken(r)
+	var hit Key
+	matched := 0
+	for _, k := range keys {
+		if subtle.ConstantTimeCompare(digest(tok), digest(k.Secret)) == 1 {
+			hit = k
+			matched = 1
+		}
+	}
+	if matched == 0 {
+		return Key{}, false
+	}
+	return hit, true
+}
+
+// bearerToken 取 Authorization 头里的 Bearer 令牌；缺头/方案不符返回空串。
+func bearerToken(r *http.Request) string {
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, bearerPrefix) {
+		return ""
+	}
+	return authz[len(bearerPrefix):]
+}
+
 // VerifyBearer 校验请求头是否携带正确的 Bearer 密钥。
 //
 // key 为空表示"未启用鉴权"，恒返回 true（调用方据此放行）。
@@ -26,14 +75,8 @@ func VerifyBearer(r *http.Request, key string) bool {
 	if key == "" {
 		return true
 	}
-	authz := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authz, bearerPrefix) {
-		// 缺头/方案不对：仍走一次摘要比较，保持耗时形状一致。
-		subtle.ConstantTimeCompare(digest(""), digest(key))
-		return false
-	}
-	tok := authz[len(bearerPrefix):]
-	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
+	// 缺头/方案不对时 bearerToken 返回空串，仍走一次摘要比较，保持耗时形状一致。
+	return subtle.ConstantTimeCompare(digest(bearerToken(r)), digest(key)) == 1
 }
 
 // digest 返回 s 的 SHA-256（定长 32 字节，供常量时间比较）。

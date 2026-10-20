@@ -50,6 +50,34 @@ func TestVerifyBearerWithoutHeaderStillCompares(t *testing.T) {
 	}
 }
 
+func TestAuthenticate(t *testing.T) {
+	keys := []Key{
+		{ID: "admin", Secret: "sk-admin", Admin: true, DefaultEffort: "high"},
+		{ID: "codex", Secret: "sk-codex", PerModel: map[string]string{"glm-5.2": "max"}},
+	}
+
+	k, ok := Authenticate(req("Bearer sk-admin"), keys)
+	if !ok || k.ID != "admin" || !k.Admin || k.DefaultEffort != "high" {
+		t.Fatalf("admin 身份错误: ok=%v key=%+v", ok, k)
+	}
+	k, ok = Authenticate(req("Bearer sk-codex"), keys)
+	if !ok || k.ID != "codex" || k.Admin || k.PerModel["glm-5.2"] != "max" {
+		t.Fatalf("普通密钥身份错误: ok=%v key=%+v", ok, k)
+	}
+	if _, ok := Authenticate(req("Bearer sk-wrong"), keys); ok {
+		t.Error("错误密钥不应通过")
+	}
+	if _, ok := Authenticate(req(""), keys); ok {
+		t.Error("缺 Authorization 头不应通过")
+	}
+
+	// 空表 = 未启用鉴权：放行且身份为零值。
+	k, ok = Authenticate(req(""), nil)
+	if !ok || k.ID != "" || k.Admin {
+		t.Fatalf("空密钥表应放行零值身份: ok=%v key=%+v", ok, k)
+	}
+}
+
 func TestDigestIsFixedLength(t *testing.T) {
 	// 不同长度输入摘要后应等长（这是常量时间比较的前提）
 	if len(digest("")) != len(digest("a-much-longer-secret-value")) {

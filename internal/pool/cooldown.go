@@ -140,9 +140,12 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 //   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
 //     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
 //     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
-//   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
-//     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
-//     冷却越堆越厚）。不记录模型（不豁免）。
+//   - resetAt 零值且 model 非空（6004/14003 无时间文案）→ 只把 **(账号, 模型)** 停车：
+//     modelCooldowns[model].Until = now + 有界退避（base 起按 Hits 翻倍、封顶
+//     softRateMax），**不写 until**。上游语义就是「这个模型忙，换模型」，按账号冷却
+//     会把一个模型抖动放大成整池停摆（2026-10-16 线上：几个并发请求几十秒冷掉
+//     十几个号 → 全站 503 十分钟）。
+//   - resetAt 零值且 model 为空 → 无从「只停该模型」，退回账号级有界退避（原语义）。
 //
 // 与旧实现的差异：有上游重置时间时绝对不做指数堆加；无重置时间时，「冷却中兜底
 // 探测再 429」不再 softStreak++ 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
@@ -161,9 +164,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
-		} else {
-			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
-			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
+		} else if model == "" {
+			// 无模型名（无从只停该模型）：账号级有界退避（base 起按 softStreak 翻倍、
+			// 封顶 softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
 			if e.coolKind != CoolSoft || !now.Before(e.until) {
 				d := p.softDurationLocked(base, e.softStreak+1)
 				e.softStreak++
@@ -172,6 +175,19 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			e.coolKind = CoolSoft
 			e.reason = reason
 			clearRoutingModelCooldownsLocked(e)
+		} else {
+			// 无解析时间：只停 (账号, 模型)，不动账号级 until。
+			// TTL 沿用 soft_rate 家族（base 起按 Hits 翻倍、封顶 softRateMax），与
+			// 「带解析时间」分支同表（modelCooldowns），面板台账自动可见。
+			if e.modelCooldowns == nil {
+				e.modelCooldowns = map[string]modelCooldown{}
+			}
+			hits := e.modelCooldowns[model].Hits + 1
+			e.modelCooldowns[model] = modelCooldown{
+				Until:  now.Add(p.softDurationLocked(base, hits)),
+				Reason: reason,
+				Hits:   hits,
+			}
 		}
 		p.dirty.Store(true)
 	}

@@ -11,14 +11,37 @@ package livecfg
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 )
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
+	// APIKey 旧版单一密钥（保留供面板展示/兼容）；鉴权一律走 APIKeys。
+	APIKey string
+	// APIKeys 运行期密钥表（api_keys + 旧版 api_key）。空 = 不鉴权。
+	APIKeys []httpauth.Key
+
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
 	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+
+	// 积分闸（0 = 关闭对应闸）。面板保存配置后下一请求生效，无需重启。
+	BudgetDailyCreditLimit float64 // 当日累计 credit 上限
+	BudgetBurstCreditLimit float64 // 5 分钟窗口内累计 credit 上限
+	BudgetCacheLowRate     float64 // 连续低缓存率触发阈值（百分比）
+}
+
+// Keys 返回生效密钥表：优先 APIKeys；为空时把旧版 APIKey 合成为 admin 身份。
+// 这层兜底保证「只填了 APIKey、没填 APIKeys」的部分构造场景不会静默变成无鉴权。
+func (s Snapshot) Keys() []httpauth.Key {
+	if len(s.APIKeys) > 0 {
+		return s.APIKeys
+	}
+	if s.APIKey == "" {
+		return nil
+	}
+	return []httpauth.Key{{ID: "legacy", Secret: s.APIKey, Name: "api_key", Admin: true}}
 }
 
 // Holder 原子持有当前快照。
@@ -45,4 +68,29 @@ func (h *Holder) Load() Snapshot {
 }
 
 // Store 整体替换快照。
-func (h *Holder) Store(s Snapshot) { h.p.Store(&s) }
+//
+// 密钥表做深拷贝：Store 后调用方可能继续复用/修改传入的 map（例如配置对象被
+// 再次 normalize），若共享底层 PerModel，读方会在无锁状态读到并发写。
+func (h *Holder) Store(s Snapshot) {
+	s.APIKeys = cloneKeys(s.APIKeys)
+	h.p.Store(&s)
+}
+
+// cloneKeys 复制密钥表（含 per-model 档位 map），保证快照不可变。
+func cloneKeys(in []httpauth.Key) []httpauth.Key {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]httpauth.Key, len(in))
+	for i, k := range in {
+		if len(k.PerModel) > 0 {
+			m := make(map[string]string, len(k.PerModel))
+			for mk, mv := range k.PerModel {
+				m[mk] = mv
+			}
+			k.PerModel = m
+		}
+		out[i] = k
+	}
+	return out
+}

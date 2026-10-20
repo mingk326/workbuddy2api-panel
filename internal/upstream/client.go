@@ -240,10 +240,14 @@ var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
 // SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
 func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 
-// modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
-// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
-// 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
-const modelRateLimitCode = "6004"
+// modelRateLimitCodes 明确指向「模型级 429 限流」的业务 code 集合。
+// 上游用它表达"该模型此刻不可用"，而不是账号整体被限流——账号健康，换模型即可：
+//   - 6004：该模型额度/用量超限（msg 带「将在 … 重置」），issue #31；
+//   - 14003 RateLimitError：官方文案「当前模型请求繁忙，请切换模型或稍后重试」。
+//     实测同号换模型立刻可用，官方 classifyErrorDetail 归 quota_request_limit，
+//     与额度耗尽（14001/14002/14012…）明确分开。按账号级处理会连带冻结整池
+//     （2026-10-16 线上：6 个并发请求 76 秒冷掉整池 → 全站 503 十分钟）。
+const modelRateLimitCodes = "6004|14003"
 
 // softRateResetPatternCN/EN 匹配重置文案（CN「将在 … 重置」/ global 域英文
 // "reset at <固定格式时间>"），捕获中间的时间串。
@@ -254,7 +258,7 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?(` + modelRateLimitCodes + `)"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -262,8 +266,8 @@ var (
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
 
-// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
-// 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
+// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004 / 14003）。
+// 用于区分"账号级软限流"（按账号冷却）与"模型级限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
 	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
 	return reModelRateLimit.MatchString(body)
@@ -323,6 +327,12 @@ func IsModelBlocked(status int, body string) bool {
 	}
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
 }
+
+// HasCodeMarker 报告 JSON 错误信封里是否存在精确等于 want 的业务 code（含嵌套
+// error/data 层）。用于区分**共用同一文案、但处置完全不同**的错误——典型是
+// "request illegal"：11-128 是渠道校验拦截（请求级、可重试），11140 是账号级
+// 授权风控（需申诉）。只比对 code 字段，不做整段文本子串匹配（避免撞在 requestId 上）。
+func HasCodeMarker(body, want string) bool { return hasBusinessCode(body, want) }
 
 // hasBusinessCode reports whether a JSON error envelope contains an exact
 // business code in a field named "code". Upstream envelopes vary between
@@ -711,6 +721,11 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
+	// thinkingOverrideMu/thinkingOverride 网关侧默认思考档注入（config thinking.*，
+	// 热生效）。nil 表示关闭（与旧行为一致：尊重客户端显式档位与模型默认档）。
+	thinkingOverrideMu sync.RWMutex
+	thinkingOverride   map[string]string // nil 关闭；非 nil 时含全局键 "" 兜底
+
 	ChatBaseCN    string
 	BillingBaseCN string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
@@ -827,6 +842,42 @@ func (c *Client) chatBase(a *auth.Auth) string {
 	return c.ChatBaseCN
 }
 
+// SetThinkingOverride 设置/关闭网关侧默认思考档注入（热生效，线程安全）。
+// defaultEffort 为全局默认；perModel 按裸模型名覆盖。全空（defaultEffort=="" 且
+// perModel 为空）= 关闭注入（回落旧行为）。非法档位已在 config 层拦截。
+func (c *Client) SetThinkingOverride(defaultEffort string, perModel map[string]string) {
+	m := map[string]string{}
+	if defaultEffort != "" {
+		m[""] = defaultEffort
+	}
+	for k, v := range perModel {
+		if strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+			m[k] = v
+		}
+	}
+	c.thinkingOverrideMu.Lock()
+	defer c.thinkingOverrideMu.Unlock()
+	if len(m) == 0 {
+		c.thinkingOverride = nil
+		return
+	}
+	c.thinkingOverride = m
+}
+
+// thinkingOverrideSnapshot 返回当前生效的思考档注入表副本；nil = 关闭。
+func (c *Client) thinkingOverrideSnapshot() map[string]string {
+	c.thinkingOverrideMu.RLock()
+	defer c.thinkingOverrideMu.RUnlock()
+	if c.thinkingOverride == nil {
+		return nil
+	}
+	cp := make(map[string]string, len(c.thinkingOverride))
+	for k, v := range c.thinkingOverride {
+		cp[k] = v
+	}
+	return cp
+}
+
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
@@ -836,6 +887,12 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
 		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
+	}
+	// 网关默认思考档注入（thinking.*）：显式客户端档位优先，不覆盖。必须在
+	// PrepareBody 之前注入——注入的档位也要走 normalizeReasoningEffort 降级管线
+	// （模型不支持所配档位时落到 ≤该档位的最高支持档，不出站非法档）。
+	if ov := c.thinkingOverrideSnapshot(); ov != nil {
+		body = InjectDefaultThinkingEffort(body, ov)
 	}
 	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
@@ -2151,10 +2208,24 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 // earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
 // 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
 func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
-	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
-	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
-	if a.IsEnterprise() {
+	// 企业版与静态 API Key 的额度都不在「个人资源包」体系内：get-user-resource* 对
+	// enterpriseId 非空账号或 ck_/pt_ Key 恒返回空 Accounts（实测 code 0 且
+	// Accounts null），故分流到企业口径端点。判据收在 auth.UsesEnterpriseBilling
+	// 一处，避免本包再写一遍前缀判断。
+	if a.UsesEnterpriseBilling() {
 		return c.enterpriseResource(a, soon)
+	}
+	// global realm 个人号：官方 5.8.4 国际版已改口径，走 summary + paid/free 明细
+	// （见 billing_summary.go）。继续用下面 CN 那套分页 body 打国际站，拿回的形态
+	// 与 CN 不同（无 Accounts 树、容量是字符串小数），会解出恒 0 余额 → 积分保底
+	// 把可用号当耗尽号挡出选号。summary 失败才回落到 CN 路径（老路径兼容尝试）。
+	if a.IsGlobal() {
+		if rm, tt, ex, ea, er, gerr := c.globalUserResource(a, soon); gerr == nil {
+			return rm, tt, ex, ea, er, nil
+		} else {
+			log.Printf("WARN: billing %s: global summary 失败，回落个人资源包路径: %v",
+				logfmt.Label(a.UID, a.Nickname), gerr)
+		}
 	}
 	now := time.Now()
 	body := map[string]any{

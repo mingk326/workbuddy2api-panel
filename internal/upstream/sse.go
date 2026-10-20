@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -24,6 +25,58 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// TruncationFinishReason 上游没有给出正常收尾时（既无 finish_reason 也无
+// data: [DONE] 就 EOF = 断流）如实上报的截断终态取值。
+//
+// 为什么是 "length"：OpenAI 协议的 finish_reason 词表里没有「上游断流」这一项，
+// 而客户端真正需要知道的事实是「这条输出是残缺的，别当完整结果用」——"length"
+// 是唯一既合法又让三条适配器如实标截断的取值（chat → length；responses →
+// incomplete/max_output_tokens；messages → stop_reason=max_tokens）。
+const TruncationFinishReason = "length"
+
+// StreamErrorFrame 识别「HTTP 200 流里内嵌的失败帧」，返回 (code, message, ok)。
+//
+// 上游把安全策略拦截（11140 request illegal）这类失败塞在 SSE 里，报文是**顶层**
+// {code,msg,displayMsg}——既没有 choices 也没有 error。normalizeFrame 的白名单会把
+// code/msg 一并剥掉，客户端于是只看到「干净地停止、无任何失败」。判据必须**窄**：
+// 只认「没有 choices 的帧」——正文里出现「安全审核」「request illegal」甚至字面
+// 11140 都是常态（模型讨论这类话题时就会说这几个词），按文本判必误伤。
+func StreamErrorFrame(obj map[string]any) (int, string, bool) {
+	if _, has := obj["choices"]; has {
+		return 0, "", false
+	}
+	if _, has := obj["error"]; has { // 已是标准 error 帧：走既有 error-passthrough
+		return 0, "", false
+	}
+	code, _ := obj["code"].(float64)
+	if code <= 0 {
+		return 0, "", false
+	}
+	msg, _ := obj["msg"].(string)
+	if msg == "" {
+		msg, _ = obj["displayMsg"].(string)
+	}
+	return int(code), msg, true
+}
+
+// streamErrorPayload 把内嵌失败帧改写成标准 error 帧：客户端据此看到真实失败，
+// 而不是一个空 chunk。code/message 原样带上，requestId 有则带上（排障靠它对
+// 上游工单），其余字段不编造。
+func streamErrorPayload(code int, msg, payload string) string {
+	e := map[string]any{"message": msg, "code": code}
+	var obj map[string]any
+	if json.Unmarshal([]byte(payload), &obj) == nil {
+		if rid, ok := obj["requestId"].(string); ok && rid != "" {
+			e["requestId"] = rid
+		}
+	}
+	raw, err := json.Marshal(map[string]any{"error": e})
+	if err != nil {
+		return payload
+	}
+	return string(raw)
+}
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
@@ -40,6 +93,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		gotAnyContent bool
 		validEvents   int
 		sawDone       bool // 上游显式发过 data: [DONE]（正常收尾）
+		sawFinish     bool // 上游显式给过非空 finish_reason（与默认值 "stop" 区分开）
 		toolCalls     = map[int]map[string]any{}
 		toolOrder     []int
 		// toolSeq 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，
@@ -176,6 +230,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 							}
 							if fr, ok := c["finish_reason"].(string); ok && fr != "" {
 								finishReason = fr
+								sawFinish = true
 							}
 							if delta, ok := c["delta"].(map[string]any); ok {
 								if r2, ok := delta["role"].(string); ok && r2 != "" {
@@ -211,6 +266,14 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
 		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
 		return nil, errEmptyStream
+	}
+	// 断流如实上报：既没给 finish_reason 也没给 data: [DONE] 就 EOF（上游连接中断），
+	// 此时 finishReason 还是初始默认值 "stop"——直接下发等于告诉客户端「模型正常
+	// 说完了」，而半截正文/残缺 tool_calls 会被当完整结果。同一判据（!sawDone）下方
+	// 处理 tool_calls 时早已在用，这里只是让它同时出现在客户端可见的 finish_reason 上。
+	// 已收到任一正常收尾信号（sawFinish 或 sawDone）则一律不动。
+	if !sawDone && !sawFinish {
+		finishReason = TruncationFinishReason
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -695,6 +758,20 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				o.onErrorFrame(payload)
 			}
 			if werr := writeRaw(payload); werr != nil {
+				return 0, werr
+			}
+			return 1, nil
+		}
+		// 流内失败帧（HTTP 200 内嵌 {code,msg,displayMsg}，无 choices）：白名单会把
+		// code/msg 剥掉，客户端只看到「干净地停止、无任何失败」——如实透出为 error
+		// 帧，并留一行日志（此前这种帧完全无痕，策略拦截被误记成上游断流）。
+		if code, msg, ok := StreamErrorFrame(obj); ok {
+			log.Printf("WARN: [upstream] 流内失败帧（HTTP 200 内嵌）code=%d msg=%q → 如实透出为 error 帧", code, msg)
+			raw := streamErrorPayload(code, msg, payload)
+			if o.onErrorFrame != nil {
+				o.onErrorFrame(raw)
+			}
+			if werr := writeRaw(raw); werr != nil {
 				return 0, werr
 			}
 			return 1, nil

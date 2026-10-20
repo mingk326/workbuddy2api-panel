@@ -74,6 +74,26 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// 积分闸（0 = 关闭对应闸；budget.go）。三道闸互相独立：
+	//   - BudgetLimit 当日累计 credit 上限（CST 自然日）；
+	//   - BudgetBurstLimit 5 分钟窗口内累计 credit 上限（止血高倍率模型）；
+	//   - BudgetCacheLowRate 连续 5 轮缓存命中率低于该百分比 → 冷却 60s。
+	BudgetLimit        float64
+	BudgetBurstLimit   float64
+	BudgetCacheLowRate float64
+
+	// MetricsEnabled 注册 GET /metrics（Prometheus 文本）。缺省关闭：
+	// 指标会暴露模型名与请求量，默认不对外开口，需要监控时显式打开。
+	// 与其他敏感端点一样走 api_key 鉴权。
+	MetricsEnabled bool
+
+	// AdminEnabled 为 true 才注册 POST /admin/tasks/{name}/run。缺省关闭。
+	AdminEnabled bool
+	// Tasks 手动补跑。nil 时开了 admin 也回 503。
+	Tasks TaskRunner
+	// Audit 非 nil 时 /admin 操作追加 JSONL。
+	Audit *AuditLog
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -82,9 +102,15 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
+		// 静态场景（测试/裸用）没有 config 对象：Snapshot.Keys() 会把单密钥
+		// 合成为 admin 身份，与 main 注入 EffectiveKeys 后的行为一致。
 		APIKey:           h.cfg.APIKey,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
+
+		BudgetDailyCreditLimit: h.cfg.BudgetLimit,
+		BudgetBurstCreditLimit: h.cfg.BudgetBurstLimit,
+		BudgetCacheLowRate:     h.cfg.BudgetCacheLowRate,
 	}
 }
 
@@ -118,6 +144,11 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// budget 积分闸（budget.go）：当日上限 + 突发窗口 + 连续低缓存率。
+	budget *dailyBudget
+	// 手动补跑去重（/admin/tasks）：同名任务同时只跑一个。
+	taskMu      sync.Mutex
+	taskRunning map[string]bool
 }
 
 // NewHandler 构建 handler。
@@ -134,11 +165,34 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), budget: newDailyBudget(cfg.BudgetLimit), taskRunning: map[string]bool{}}
+	h.budget.applyConfig(cfg.BudgetLimit, cfg.BudgetBurstLimit, cfg.BudgetCacheLowRate)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
+	// Anthropic Messages 与 Codex Responses 两种入站协议：各自转成 chat_completions
+	// 后复用同一套取号/轮转/计费/SSE 透传，协议壳只做形状转换。
+	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
+	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	// Codex 会先探测 WebSocket 升级；回 426 让它立刻粘性回落 HTTPS。
+	h.mux.HandleFunc("GET /v1/responses", h.withAuth(h.responsesWebsocketUnsupported))
+	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		h.images(w, r, false)
+	}))
+	h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		h.images(w, r, true)
+	}))
+	if cfg.MetricsEnabled {
+		h.mux.HandleFunc("GET /metrics", h.withAuth(h.promMetrics))
+	}
+	if cfg.AdminEnabled {
+		// 管理端点比 /v1 更敏感（可触发真实上游任务）：多密钥体系下要求 admin 身份。
+		h.mux.HandleFunc("POST /admin/tasks/{name}/run",
+			h.withAdminAuth(h.audit("task.run", auditPathValue("name"), h.adminTaskRun)))
+	}
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
@@ -168,13 +222,70 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
+// authKeyCtxKey 已认证密钥在请求上下文中的键。
+//
+// /v1/* 只做鉴权 + 读取该密钥的思考档覆盖；admin 标记只在面板侧生效，
+// 网关路径不区分权限（所有密钥都能调用模型）。
+type authKeyCtxKey struct{}
+
+// authenticate 用当前热加载密钥表校验请求，返回命中的身份。
+func (h *Handler) authenticate(r *http.Request) (httpauth.Key, bool) {
+	return httpauth.Authenticate(r, h.loadLive().Keys())
+}
+
+// withAdminAuth 管理端点专用：除鉴权外还要求命中 admin 密钥。
+// 未启用鉴权（密钥表为空）时与 withAuth 一样放行。
+func (h *Handler) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		keys := h.loadLive().Keys()
+		key, ok := httpauth.Authenticate(r, keys)
+		if !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
-		next(w, r)
+		if len(keys) > 0 && !key.Admin {
+			writeOpenAIError(w, http.StatusForbidden, "admin_required", "this endpoint requires an admin API key")
+			return
+		}
+		next(w, withAuthKey(r, key))
+	}
+}
+
+// withAuthKey 把已认证身份放进请求上下文（子处理器/协议转换层读取）。
+func withAuthKey(r *http.Request, k httpauth.Key) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), authKeyCtxKey{}, k))
+}
+
+// authKeyFrom 取请求上下文中的密钥身份；未鉴权路径（如 healthz）返回 false。
+func authKeyFrom(ctx context.Context) (httpauth.Key, bool) {
+	k, ok := ctx.Value(authKeyCtxKey{}).(httpauth.Key)
+	return k, ok
+}
+
+// keyThinkingOverride 把密钥的档位配置转成注入表（"" 键 = 全局兜底）。
+// 全空返回 nil = 不做任何注入（与全局 thinking.* 的"空 = 关闭"同语义）。
+func keyThinkingOverride(k httpauth.Key) map[string]string {
+	if k.DefaultEffort == "" && len(k.PerModel) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(k.PerModel)+1)
+	if k.DefaultEffort != "" {
+		m[""] = k.DefaultEffort
+	}
+	for model, effort := range k.PerModel {
+		m[model] = effort
+	}
+	return m
+}
+
+func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key, ok := h.authenticate(r)
+		if !ok {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		next(w, withAuthKey(r, key))
 	}
 }
 
@@ -507,6 +618,21 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// 积分闸（budget.go）：热配置每次请求同步一次（面板改完下一请求生效），
+	// 任一闸触发即 429 快速失败，不进入选号/上游调用。
+	live := h.loadLive()
+	h.budget.applyConfig(live.BudgetDailyCreditLimit, live.BudgetBurstCreditLimit, live.BudgetCacheLowRate)
+	if ok, why := h.budget.admit(); !ok {
+		used, limit, _, _ := h.budget.snapshot()
+		code, msg := "daily_budget_exceeded", fmt.Sprintf(
+			"daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit)
+		if why != "" {
+			// 快速闸的拒因自带可读说明，别和「当日用光」混成一句话。
+			code, msg = "credit_guard_tripped", why
+		}
+		writeOpenAIError(w, http.StatusTooManyRequests, code, msg)
+		return
+	}
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
@@ -542,7 +668,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
+	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -700,6 +826,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
 	if bareModel != peek.Model {
 		body = rewriteModel(body, bareModel)
+	}
+
+	// 按 API 密钥注入默认思考档位（多密钥体系）。顺序是关键：
+	//   - 在 model 重写之后（per_model 表按裸模型名匹配）；
+	//   - 在 upstream.prepareBody 之前（注入值仍会走 supportedEfforts 降级管线）。
+	// upstream 侧的全局 thinking.* 注入发现已有 reasoning_effort 会自动跳过，
+	// 于是优先级天然成立：客户端显式 > 密钥 per_model > 密钥默认 > 全局 per_model > 全局默认。
+	if key, ok := authKeyFrom(r.Context()); ok {
+		if override := keyThinkingOverride(key); override != nil {
+			body = upstream.InjectDefaultThinkingEffort(body, override)
+		}
 	}
 
 	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
@@ -998,7 +1135,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
-			stats := newChatStatsReaderSince(rc, st.start)
+			// 截断自动续写（见 continue.go）：上游 finish_reason=length 且为纯文本/推理
+			// 段时，同账号同模型补发「已输出内容+续写指令」，多段拼成一条客户端可见流。
+			// 显式限额 / 工具参数截断 / 续写请求失败 → 自动降级为截断终态。
+			cont := newContinueReader(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc)
+			defer cont.Close()
+			stats := newChatStatsReaderSince(cont, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
@@ -1382,12 +1524,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrSoftRate:
 		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
 		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
+		//   - 模型级（6004 / 14003）→ CooldownSoftForModel：写 modelCooldowns[model]，
+		//     切模型豁免。**无论有没有解析时间都走这条**——模型忙不是账号坏，按账号
+		//     冷却会把一个模型的抖动放大成整池停摆（实测同号换模型立刻可用）。
+		//   - 账号级（其余 429 文案）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
 		modelRateLimited := upstream.IsModelRateLimit(body)
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if modelRateLimited {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
+				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "model rate limit")
 				return
 			}
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
@@ -1395,20 +1539,22 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
 		// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
+		retryAfter := time.Time{}
 		if uerr != nil && uerr.RetryAfter > 0 {
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
-			if modelRateLimited {
-				h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
-			}
+			retryAfter = time.Now().Add(uerr.RetryAfter)
+		}
+		if modelRateLimited {
+			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, "model rate limit")
 			return
 		}
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
 		// （热改优先），管理面板改 soft_rate 后立即生效。
-		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
-		if modelRateLimited {
-			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
+		reason := "429 rate limit"
+		if !retryAfter.IsZero() {
+			reason = "429 rate limit (retry-after)"
 		}
+		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), retryAfter, reason)
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
 		// wafCooldownBase（60s，抖动后落 [45s,75s]）、softStreak 指数升级、封顶
@@ -1426,19 +1572,27 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrAccountFault:
-		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
-		//   - "request illegal"（业务码 11-128 / 11140）→ 上游**渠道校验拦截**，不是账号封禁。
+		// 账号级授权/配额故障按 code + msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
+		//   - "request illegal" + code **11-128** → 上游**渠道校验拦截**，请求级可重试信号：
 		//     上游 body 自带 displayMsg「请求被拦截，请重新发送」与 displayTips「渠道校验失败，
-		//     可能不是从官方客户端发出的，请用官方客户端重新发送」——上游明示这是可重试的请求级
-		//     拦截。实测该账号凭证/余额/JWT 全部正常，同一套出站头部换健康账号即可 200，换任何
-		//     模型、任何 header 变体都稳定复现，属上游按账号下发的风控标记。历史实现在此处
-		//     Disable，会把仍可用的账号永久踢出池子并要求人工解冻（issue #197）。改为软冷却：
-		//     账号暂时出池、自动轮换，上游解除标记后自愈，绝不永久禁用。
+		//     可能不是从官方客户端发出的，请用官方客户端重新发送」。实测该账号凭证/余额/JWT
+		//     全部正常、换模型换头不改结果，属按账号下发的风控标记 → 软冷却，解除后自愈，
+		//     绝不永久禁用（issue #197）。
+		//   - "request illegal" + code **11140** → auth_forbidden，账号级授权风控：软冷却
+		//     等不到自愈，到期后被反复选中试错只会持续刷上游风控 → 硬禁用并提示去官方申诉。
+		//   - 其余 "request illegal"（信封里没有可辨识 code）→ 宁可软冷却也不误杀账号。
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "channel verification blocked (11-128 request illegal)")
+			switch {
+			case upstream.HasCodeMarker(body, "11-128"):
+				h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "channel verification blocked (11-128 request illegal)")
+			case upstream.HasCodeMarker(body, "11140"):
+				h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
+			default:
+				h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "request illegal (code unknown)")
+			}
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
