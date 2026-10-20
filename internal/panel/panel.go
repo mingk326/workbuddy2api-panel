@@ -185,6 +185,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
+	// 单号旅行（issue #227）：与 checkin 同构，供外部调度器做「每号独立随机时点」。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/travel", p.withAuth(p.accountTravel))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
@@ -753,6 +755,40 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	p.cfg.CreditHist.Observe(uid, remain)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
+}
+
+// accountTravel 单号猫猫旅行巡检（issue #227）：与 checkin 同构，单号推进一趟
+// ——无猫领养，有猫按 status 派出/领奖。
+//
+// 供外部调度器做「每号独立随机时点」：与全池 travel_all 不同，本端点不带号间
+// 限速，间隔完全由调用方决定（固定 800ms 全池节拍是明确的脚本指纹）。
+//
+// 语义分层：uid 不存在 → 404；门控跳过（禁用 / global / 企业版 / API Key）
+// → 200 + ok:false + skipped 原因——跳过是正常不适用，不是错误。
+func (p *Panel) accountTravel(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	if p.cfg.Pool.AuthByUID(uid) == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	// 与「任务中心 / 一键完成」共用 per-account 互斥：同一账号的旅行动作不并发，
+	// 避免「查状态→派出」两次交错导致重复派出。
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "该账号有任务正在执行，请稍后重试")
+		return
+	}
+	defer p.unlockAccount(uid)
+	skipped, ran := p.cfg.Scheduler.RunTravelUID(uid)
+	if !ran {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "skipped": skipped})
+		return
+	}
+	log.Printf("panel: 单号旅行 uid=%s（结果见任务日志）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。

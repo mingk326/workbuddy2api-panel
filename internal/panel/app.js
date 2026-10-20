@@ -459,6 +459,9 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : (s.api_key ? ' title="刷新 API Key 账号额度（上游 get-enterprise-user-usage）"' : '')) + '>' + ((s.enterprise || s.api_key) ? '额度' : '余额') + '</button>' +
         ((s.enterprise || s.api_key) ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+        // 单号旅行（issue #227）：仅 CN 个人账号有成长体系；global 无任务体系。
+        ((s.enterprise || s.api_key || s.realm === 'global') ? '' :
+          '<button class="xs ghost" data-a="travel" data-u="' + esc(s.uid) + '" title="推进一趟猫猫旅行：无猫领养 / 有猫派出或领奖">旅行</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + ((s.enterprise || s.api_key) ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
@@ -561,6 +564,10 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'resume') {
       await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
       toast('已恢复选号', 'ok');
+    } else if (a === 'travel') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/travel', { method: 'POST' });
+      if (r.ok) toast('旅行巡检已执行，结果见运行日志', 'ok');
+      else toast('已跳过：' + (r.skipped || '该账号不适用'), '');
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'remove') {

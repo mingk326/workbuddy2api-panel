@@ -475,6 +475,63 @@ func TestRunTravelLoopStopsOnCancel(t *testing.T) {
 	}
 }
 
+// TestRunTravelUIDOnlyRunsTarget 按号端点（issue #227）：只推进指定账号，
+// 池内其他账号零调用——这是「每号独立随机时点」外部调度的前提。
+func TestRunTravelUIDOnlyRunsTarget(t *testing.T) {
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, _ := newTravelScheduler(t, srv, "u1", "u2")
+	skipped, ran := s.RunTravelUID("u2")
+	if !ran || skipped != "" {
+		t.Fatalf("RunTravelUID(u2) = (%q, %v) want (\"\", true)", skipped, ran)
+	}
+	if n := stub.infoCalls.Load(); n != 1 {
+		t.Errorf("buddy/info calls=%d want 1（只应触碰指定账号）", n)
+	}
+	if n := stub.agreeCalls.Load(); n != 1 {
+		t.Errorf("agreement calls=%d want 1", n)
+	}
+}
+
+// TestRunTravelUIDGates 按号入口与全池入口共用同一套门控：不存在 / 禁用 /
+// 企业版 / 静态 API Key / global 一律跳过，且不发任何上游请求。
+func TestRunTravelUIDGates(t *testing.T) {
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+
+	cases := []struct {
+		name string
+		set  func(*pool.Pool)
+		uid  string
+	}{
+		{"不存在的账号", func(*pool.Pool) {}, "ghost"},
+		{"已禁用", func(p *pool.Pool) { p.Disable("u1", "test") }, "u1"},
+		{"企业版", func(p *pool.Pool) { p.AuthByUID("u1").EnterpriseID = "ent-1" }, "u1"},
+		{"静态 API Key", func(p *pool.Pool) { p.AuthByUID("u1").AccessToken = "ck_abc" }, "u1"},
+		{"global 账号", func(p *pool.Pool) { p.AuthByUID("u1").Domain = "www.workbuddy.ai" }, "u1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, p := newTravelScheduler(t, srv, "u1")
+			c.set(p)
+			before := stub.infoCalls.Load()
+			why, ran := s.RunTravelUID(c.uid)
+			if ran {
+				t.Fatalf("%s 不应执行", c.name)
+			}
+			if why == "" {
+				t.Errorf("%s 应给出跳过原因", c.name)
+			}
+			if got := stub.infoCalls.Load(); got != before {
+				t.Errorf("%s 不应发起上游请求（buddy/info %d -> %d）", c.name, before, got)
+			}
+		})
+	}
+}
+
 // TestTravelDayAlignsCST 每日重置按 CST 自然日判定（UTC 17:00 已是次日 CST）。
 func TestTravelDayAlignsCST(t *testing.T) {
 	cases := []struct {

@@ -41,26 +41,45 @@ func travelDay(t time.Time) string {
 	return t.In(cstZone).Format("2006-01-02")
 }
 
-// RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检。
+// travelSkipReason 返回该账号不应参与旅行的原因；空串 = 可跑。
+//
+// RunTravelNow（全池）与 RunTravelUID（按号）共用这一套门控，避免两条入口
+// 长期演化后口径漂移（一处加了门控、另一处漏加）。
 // 禁用账号跳过；暂停选号（paused）账号照常参与——旅行是纯 RPC（状态/派出/
-// 领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突；
+// 领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突。
+func (s *Scheduler) travelSkipReason(a *auth.Auth, disabled bool) string {
+	if a == nil {
+		return "account not found"
+	}
+	if disabled {
+		return "账号已禁用"
+	}
+	if a.RefreshTokenValue() == "" {
+		return "缺少 refresh token（未登录或凭证损坏）"
+	}
+	if a.IsGlobal() {
+		// D4 门控：global 无 CN 任务体系，不发起任何上游调用。
+		return "global 账号无猫猫旅行体系"
+	}
+	if !a.SupportsPersonalGrowth() {
+		// 企业版 / 静态 API Key 门控：无成长体系，不发起任何上游调用。
+		if a.IsAPIKey() {
+			return "API Key 账号无猫猫旅行体系"
+		}
+		return "企业账号无猫猫旅行体系"
+	}
+	return ""
+}
+
+// RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检。
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
 func (s *Scheduler) RunTravelNow() {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
+		if s.travelSkipReason(a, st.Disabled) != "" {
 			continue
-		}
-		if a.IsGlobal() {
-			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
-		}
-		if !a.SupportsPersonalGrowth() {
-			continue // 企业版 / 静态 API Key 门控：无成长体系，不发起任何上游调用
 		}
 		if !first {
 			time.Sleep(travelAccountDelay)
@@ -68,6 +87,28 @@ func (s *Scheduler) RunTravelNow() {
 		first = false
 		s.travelOne(a)
 	}
+}
+
+// RunTravelUID 对单个账号执行一趟旅行巡检（issue #227：按号分散触发）。
+//
+// 与 RunTravelNow 的差异只在「选谁」：门控完全共用，且不做号间限速——单号
+// 天然没有批量节拍问题，外部调度器自行决定每个账号的时点与间隔。
+// 返回 (跳过原因, 是否执行)；跳过不算错误（禁用 / global / 企业版 / API Key
+// 都属正常不适用）。
+func (s *Scheduler) RunTravelUID(uid string) (string, bool) {
+	a := s.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return "account not found", false
+	}
+	disabled := false
+	if st, ok := s.cfg.Pool.Status(uid); ok {
+		disabled = st.Disabled
+	}
+	if why := s.travelSkipReason(a, disabled); why != "" {
+		return why, false
+	}
+	s.travelOne(a)
+	return "", true
 }
 
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
