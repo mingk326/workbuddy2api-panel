@@ -177,6 +177,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
 	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	// 官方客户端的模型忙闲预检（本地按池状态算，不打上游）。
+	h.mux.HandleFunc("POST /v2/chat/busy", h.withAuth(h.chatBusy))
 	// Codex 会先探测 WebSocket 升级；回 426 让它立刻粘性回落 HTTPS。
 	h.mux.HandleFunc("GET /v1/responses", h.withAuth(h.responsesWebsocketUnsupported))
 	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(func(w http.ResponseWriter, r *http.Request) {
@@ -650,6 +652,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
+	// 客户端原始思考档位（issue #43 口径）：必须在任何网关侧注入之前抓，否则
+	// 「客户端没发 max、网关按密钥注入 max 再被降级」和「客户端发了 max」在日志里
+	// 长得一模一样。空 = 客户端未携带。
+	effortTrace := &upstream.EffortTrace{Client: upstream.RequestedEffort(body)}
 
 	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
 	// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的 tools」
@@ -669,6 +675,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
+	st.effortClient = effortTrace.Client
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -955,7 +962,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta, effortTrace)
+		// 档位溯源落到本次统计（换号重试时后者覆盖前者：同一 body 结果一致）。
+		st.effortIn, st.effortOut = effortTrace.In, effortTrace.Out
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析）。传输层错误（非 *Error）走抖动换号分支；防御分支
 		// （terr 为 nil 但 status>=400，如 ErrNone 兜底）回落本地 Classify，双保险。

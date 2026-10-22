@@ -27,13 +27,26 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 // PrepareBodyOptWithEffortsAndDefault 完整管线：efforts 降级 + thinking.go 按
 // defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
 // （deepseek 缺档回退硬编码 high）。
+//
+// 档位溯源请用 PrepareBodyWithEffortTrace（本函数丢弃 trace，保持旧签名）。
 func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	out, _, _ := PrepareBodyWithEffortTrace(src, sanitize, efforts, defaultEfforts)
+	return out
+}
+
+// PrepareBodyWithEffortTrace 同 PrepareBodyOptWithEffortsAndDefault，额外返回
+// (降级前档位, 最终档位)，供请求流水行展示「要什么 / 发出去什么」（issue #43）。
+//   - in 在 injectThinking 之前抓取：此时若已有档位，只可能来自客户端或网关注入
+//     （含密钥 / 全局 thinking.*），不含 deepseek 补的模型默认档；
+//   - eff 在 normalizeReasoningEffort 之后抓取，是真正出站的值；
+//   - 未携带 / 未知模型 / 未知档位 → 空串。
+func PrepareBodyWithEffortTrace(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) (out []byte, in, eff string) {
 	if len(src) == 0 {
-		return src
+		return src, "", ""
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
-		return src
+		return src, "", ""
 	}
 	obj["stream"] = true
 	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
@@ -70,12 +83,16 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
 		obj["messages"] = msgs
 	}
+	// 档位溯源（issue #43）：在 injectThinking 补默认档之前抓「进入管线时要什么」，
+	// 否则 deepseek 缺档被补 high 之后，就分不清 high 是客户端发的还是网关补的。
+	in = effortOf(obj)
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	modelName, _ := obj["model"].(string)
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
 	normalizeReasoningEffort(obj, efforts)
+	eff = effortOf(obj)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
@@ -84,11 +101,11 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 			sanitizeMessages(msgs)
 		}
 	}
-	out, err := json.Marshal(obj)
+	b, err := json.Marshal(obj)
 	if err != nil {
-		return src
+		return src, in, eff
 	}
-	return out
+	return b, in, eff
 }
 
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游

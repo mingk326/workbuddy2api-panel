@@ -75,6 +75,14 @@ func (s *Scheduler) travelSkipReason(a *auth.Auth, disabled bool) string {
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
 func (s *Scheduler) RunTravelNow() {
+	s.runTravel(false)
+}
+
+// runTravel 旅行遍历实现。scheduled=true（排程触发）时按账号摊开
+// （schedule.account_spread_minutes）；手动触发不摊开，立刻跑完。
+func (s *Scheduler) runTravel(scheduled bool) {
+	plan := s.spreadPlan(taskTravel, scheduled, time.Now())
+	ctx := s.runCtx()
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -82,9 +90,15 @@ func (s *Scheduler) RunTravelNow() {
 			continue
 		}
 		if !first {
-			time.Sleep(travelAccountDelay)
+			if !sleepCtx(ctx, travelAccountDelay) {
+				return
+			}
 		}
 		first = false
+		// 账号级摊开：等到本号今日的偏移时刻（未启用时立即放行）。
+		if !plan.wait(ctx, st.UID) {
+			return
+		}
 		s.travelOne(a)
 	}
 }

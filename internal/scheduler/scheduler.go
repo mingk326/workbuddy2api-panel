@@ -62,6 +62,13 @@ type Config struct {
 	// 选号**——pool.pick 侧的 disabled 过滤与本开关无关。
 	IncludeDisabledInTasks bool
 
+	// AccountSpreadMinutes 账号级摊开窗口（分钟，0 = 关闭）：排程触发的账号遍历型
+	// 任务（签到 / 旅行 / 活跃上报 / 保活）每号在窗口内自己的偏移上执行，
+	// 不再同一秒打全池。手动触发不受影响。见 spread.go。
+	AccountSpreadMinutes int
+	// AccountSpreadMinGapSeconds 摊开时相邻账号的最小间隔（秒）；<=0 回落 30。
+	AccountSpreadMinGapSeconds int
+
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
@@ -102,6 +109,16 @@ type Scheduler struct {
 	// 见 allowAuthHeal：降级 token 会让每轮探测都 401，不设退避就是每 5 分钟轮换一次 RT。
 	authHealMu sync.Mutex
 	authHealAt map[string]time.Time
+
+	// spreadMinutes/spreadGapSeconds 账号级摊开参数（分钟 / 秒，0 = 关闭）。
+	// atomic 读写：面板保存配置后可热改，下一轮排程任务立即生效。
+	spreadMinutes    atomic.Int64
+	spreadGapSeconds atomic.Int64
+
+	// runCtxMu/baseCtx 主循环 ctx（Run 启动时保存）：摊开等待据此在优雅停机时
+	// 立即退出，不必等睡满窗口。
+	runCtxMu sync.RWMutex
+	baseCtx  context.Context
 }
 
 // authHealBackoff 同一账号 401→refresh 求证的最小间隔。
@@ -154,13 +171,15 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 		rearmSweep:    make(chan struct{}, 1),
 	}
+	s.SetAccountSpread(cfg.AccountSpreadMinutes, cfg.AccountSpreadMinGapSeconds)
+	return s
 }
 
 // ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
@@ -414,6 +433,8 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
+	// 摊开等待读取该 ctx：优雅停机时立即放弃剩余账号，不等睡满窗口。
+	s.setRunCtx(ctx)
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -457,13 +478,13 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.runCheckin(true)
 			case taskTravel:
-				s.RunTravelNow()
+				s.runTravel(true)
 			case taskActivity:
-				s.runActivity(ctx)
+				s.runActivity(ctx, true)
 			case taskKeepalive:
-				s.RunKeepaliveNow()
+				s.runKeepalive(true)
 			case taskBlackcat:
 				s.RunBlackcatNow()
 			case taskGrowth:
@@ -503,6 +524,13 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	s.runCheckin(false)
+}
+
+// runCheckin 签到遍历实现。scheduled=true（排程触发）时按 schedule.account_spread_minutes
+// 摊开；手动触发不摊开，立刻跑完。
+func (s *Scheduler) runCheckin(scheduled bool) {
+	plan := s.spreadPlan(taskCheckin, scheduled, time.Now())
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -518,6 +546,10 @@ func (s *Scheduler) RunCheckinNow() {
 		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
 		if a.IsGlobal() {
 			continue
+		}
+		// 账号级摊开：等到本号今日的偏移时刻（未启用时立即放行）；ctx 取消即放弃剩余账号。
+		if !plan.wait(s.runCtx(), st.UID) {
+			return
 		}
 		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
@@ -579,11 +611,12 @@ func (s *Scheduler) RunCheckinNow() {
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+	s.runActivity(context.Background(), false)
 }
 
-// runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+// runActivity 活跃上报遍历，随 ctx 取消立即退出。scheduled=true 时按账号摊开。
+func (s *Scheduler) runActivity(ctx context.Context, scheduled bool) {
+	plan := s.spreadPlan(taskActivity, scheduled, time.Now())
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -600,6 +633,10 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 该类"静默无效"最易被忽略（日志无异常），故显式跳过，不给上游多发一次请求。
 		if !a.SupportsPersonalGrowth() {
 			continue
+		}
+		// 账号级摊开（仅排程触发；手动触发 plan 为 nil 立即放行）。
+		if !plan.wait(ctx, st.UID) {
+			return
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
 		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切，
@@ -650,6 +687,12 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.runKeepalive(false)
+}
+
+// runKeepalive 保活遍历实现。scheduled=true（排程触发）时按账号摊开。
+func (s *Scheduler) runKeepalive(scheduled bool) {
+	plan := s.spreadPlan(taskKeepalive, scheduled, time.Now())
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -658,6 +701,9 @@ func (s *Scheduler) RunKeepaliveNow() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
+		}
+		if !plan.wait(s.runCtx(), st.UID) {
+			return
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)

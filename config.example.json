@@ -75,7 +75,9 @@
     "balance_refresh_minutes": 5,
     "task_sweep_enabled": true,
     "task_sweep_minutes": 15,
-    "include_disabled_in_tasks": false
+    "include_disabled_in_tasks": false,
+    "account_spread_minutes": 0,
+    "account_spread_min_gap_seconds": 30
   },
   "global": {
     "enabled": true,
@@ -92,7 +94,9 @@
     "client_name": "",
     "device_token": "",
     "device_token_file": "",
-    "passthrough_ip": false
+    "passthrough_ip": false,
+    "dump_dir": "",
+    "dump_request_max": 0
   },
   "features": {
     "sanitize_blacklist_fingerprints": true

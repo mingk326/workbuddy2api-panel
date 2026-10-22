@@ -173,6 +173,17 @@ type Config struct {
 		// 「已达标但没人领」的成长任务奖励领掉（issue #174）。缺省开、15 分钟。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// AccountSpreadMinutes 账号级摊开窗口（分钟）。>0 时，排程触发的账号遍历型
+		// 任务（签到 / 旅行 / 活跃上报 / 保活）不再「同一秒打全池」，而是每号在
+		// 窗口内自己的偏移上执行；0 = 关闭（保持整点齐发现状）。
+		// 偏移 = hash(任务|uid|当日) % 窗口，当天确定性（重启不重排）；手动触发
+		// （面板按钮 / API）不受影响，要的是立刻跑完。
+		AccountSpreadMinutes int `json:"account_spread_minutes"`
+		// AccountSpreadMinGapSeconds 摊开时相邻账号的最小间隔（秒）；<=0 回落 30。
+		// 防止哈希碰撞让两个号仍落在同一秒（等距节拍同样是可识别的时间形状，
+		// 因此只做「最少间隔」约束，不做均匀分配）。
+		AccountSpreadMinGapSeconds int `json:"account_spread_min_gap_seconds"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -214,6 +225,13 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// DumpDir 上游原始报文旁路落盘目录（诊断用；空 = 关闭）。
+		// 每次 chat 请求落一个自包含文件：出站请求体 + 上游原始 SSE 字节。
+		// 正文含用户提示词，只在显式配置时开启；改动需重启进程。
+		DumpDir string `json:"dump_dir"`
+		// DumpRequestMax 单个 dump 文件中请求体片段上限（字节）；<=0 回落 256 KiB。
+		// 长会话的 tools 可能排在几百条 messages 之后，默认值常在中途截断。
+		DumpRequestMax int64 `json:"dump_request_max"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -344,6 +362,9 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	// 账号级摊开缺省关闭（保持既有整点齐发行为），最小间隔 30s。
+	c.Schedule.AccountSpreadMinutes = 0
+	c.Schedule.AccountSpreadMinGapSeconds = 30
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -509,6 +530,9 @@ func applyEnv(c *Config) {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Upstream.PassthroughIP = b
 		}
+	}
+	if v := os.Getenv("WB2A_DUMP_UPSTREAM"); v != "" {
+		c.Upstream.DumpDir = v
 	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -677,6 +701,18 @@ func (c *Config) normalize() error {
 			c.Schedule.TaskSweepMinutes = 15
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
+	}
+	// 账号级摊开：负窗口钳 0（= 关闭）；最小间隔缺省 30s（仅窗口 > 0 时有意义，
+	// 但统一归一可让面板展示稳定）。
+	if c.Schedule.AccountSpreadMinutes < 0 {
+		c.Schedule.AccountSpreadMinutes = 0
+	}
+	if c.Schedule.AccountSpreadMinGapSeconds <= 0 {
+		c.Schedule.AccountSpreadMinGapSeconds = 30
+	}
+	// dump：负值钳 0（= 用内置默认 256 KiB）。
+	if c.Upstream.DumpRequestMax < 0 {
+		c.Upstream.DumpRequestMax = 0
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

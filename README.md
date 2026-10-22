@@ -379,6 +379,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
 | `schedule.task_sweep_enabled` | `true` | 任务补领清扫：周期扫描成长任务的「已达标未领」并幂等 accept/claim（不跑行为链路） |
 | `schedule.task_sweep_minutes` | `15` | 补领清扫周期（分钟） |
+| `schedule.account_spread_minutes` | `0` | 账号级摊开窗口（分钟）：>0 时**排程触发**的签到 / 旅行 / 活跃上报 / 保活不再同一秒打全池，每号在窗口内自己的哈希偏移上执行（当天确定性，重启不重排）；手动触发不摊开。`0` = 关闭 |
+| `schedule.account_spread_min_gap_seconds` | `30` | 摊开时相邻账号最小间隔（秒），防止哈希碰撞让两个号落在同一秒 |
 | `budget.daily_credit_limit` | `0` | 当日累计积分上限（CST 自然日，按上游 `usage.credit` 观测值累计）；`0` = 关闭 |
 | `budget.burst_credit_limit` | `0` | 5 分钟窗口积分上限（止血高倍率模型）；`0` = 关闭 |
 | `budget.cache_low_rate` | `0` | 连续 5 轮缓存命中率低于该百分比 → 冷却 60s；`0` = 关闭 |
@@ -395,6 +397,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `upstream.dump_dir` | 空 | 上游原始报文旁路落盘目录（诊断用，空 = 关闭；也可用 `WB2A_DUMP_UPSTREAM`）。每次 chat 请求落一个文件：出站请求体 + 上游原始 SSE 字节，单文件封顶 8MB，写盘失败不影响请求。**正文含用户提示词**，仅在排障时临时开启；改动需重启 |
+| `upstream.dump_request_max` | `0` | 单个 dump 文件的请求体片段上限（字节），`0` = 默认 256 KiB。长会话的 tools 常排在几百条 messages 之后，可调大 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
@@ -708,6 +712,7 @@ http://127.0.0.1:7863/panel/
 | `POST /v1/messages`（`/messages`） | `x-api-key` / Bearer | Anthropic Messages 协议适配（`message_start` / `content_block_*` / `message_delta`）；客户端声明 `web_search` 时由网关代执行检索 |
 | `POST /v1/images/generations` · `/v1/images/edits` | Bearer | 图像生成/编辑（CN `hunyuan-image-alpha`、global `gpt-image-2.5-sunburst`） |
 | `POST /v1/search` | Bearer | 官方 agenttool 联网检索（snippet；`deep=true` 走综述式 agentic_search） |
+| `POST /v2/chat/busy` | Bearer | 官方客户端模型忙闲预检：`{"models":[...]}` → `busy_level` = `idle` / `busy`（该域全池模型级冷却）/ `unknown`（不在服务目录）。本地按池状态计算，不打上游 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -859,7 +864,8 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 - 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
 - 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头）
-- 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
+- 思考档位溯源段（`effort=...`，issue #43）：`max->high` = 客户端发了 max、被模型档位表降级；`high` = 客户端发 high 且未降级；`gw:max->high` = 客户端未带档位、网关按密钥/全局配置注入 max 后降级。整段缺失 = 本请求未参与档位处理
+- 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件；**例外**是显式开启的 `upstream.dump_dir`（落请求/响应原文，含用户提示词，排障后应关闭并清理）
 
 ### 3. 发布来源与合规边界
 

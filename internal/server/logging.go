@@ -70,6 +70,12 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// 思考档位溯源（issue #43）：client 为客户端原始档位（任何注入之前），
+	// in 为出站管线降级前、out 为最终出站。渲染规则见 effortLabel。
+	effortClient string
+	effortIn     string
+	effortOut    string
+
 	// budget 积分闸（可选）：请求出口把观测到的 credit / 缓存率喂给它。
 	budget *dailyBudget
 
@@ -92,8 +98,9 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	total := time.Since(s.start)
-	logChatRowEx(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+	logChatRowFull(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks,
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent,
+		effortLabel(s.effortClient, s.effortIn, s.effortOut))
 	// 积分闸只吃**观测到的**值：credit 缺失不按 0 计（否则会把闸门当"免费"放行），
 	// 缓存字段缺失不参与命中率判定（模型不报缓存 ≠ 零命中）。
 	s.budget.add(s.credit, s.hasCredit)
@@ -504,6 +511,38 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
 	clientIP, userAgent string) {
+	logChatRowFull(ttfb, total, model, mode, uid, nick, status, toks,
+		requestID, outcome, attempts, credit, hasCredit, clientIP, userAgent, "")
+}
+
+// effortLabel 渲染档位溯源段（issue #43）：空串 = 不追加任何字段。
+//
+//   - 客户端显式档位：`max->xhigh`（被降级）或 `high`（未降级）；
+//   - 客户端未带、网关侧注入：`gw:max->xhigh` / `gw:high`（gw 前缀标明来源，
+//     避免被误读成客户端发的档位）；
+//   - 三段皆空：不显示（模型未参与档位处理）。
+func effortLabel(client, in, out string) string {
+	switch {
+	case client != "":
+		if out != "" && !strings.EqualFold(client, out) {
+			return client + "->" + out
+		}
+		return client
+	case in != "":
+		if out != "" && !strings.EqualFold(in, out) {
+			return "gw:" + in + "->" + out
+		}
+		return "gw:" + in
+	default:
+		return ""
+	}
+}
+
+// logChatRowFull 是本文件唯一的行输出点：在 logChatRowEx 的基础上多一个可选
+// 档位溯源段（effort 为空时不追加，旧行格式逐字不变）。
+func logChatRowFull(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
+	requestID, outcome string, attempts int, credit float64, hasCredit bool,
+	clientIP, userAgent, effort string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -553,7 +592,12 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		}
 		src = fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
+	// 档位溯源段：为空时整段省略，旧行格式逐字不变。
+	eff := ""
+	if effort != "" {
+		eff = " effort=" + effort + " |"
+	}
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -564,6 +608,7 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		logfmt.Pad(tokField, chatTokWidth),
 		logfmt.Pad(tokpsField, chatRateWidth),
 		total.Seconds(),
+		eff,
 		extra,
 		src,
 	)

@@ -693,6 +693,12 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// DumpDir 上游原始报文旁路落盘目录（诊断用；空 = 关闭）。
+	// 只在启动时由 config 注入，面板改动需重启（避免与热路径并发读写竞争）。
+	DumpDir string
+	// DumpRequestMax 单个 dump 文件的请求体片段上限（字节）；<=0 用内置 256 KiB。
+	DumpRequestMax int64
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -880,7 +886,9 @@ func (c *Client) thinkingOverrideSnapshot() map[string]string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+// 返回 (出站请求体, 降级前档位, 降级后档位)：后两者供流水行溯源（issue #43），
+// 未参与档位处理时均为空串。
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]byte, string, string) {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
@@ -890,15 +898,15 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	}
 	// 网关默认思考档注入（thinking.*）：显式客户端档位优先，不覆盖。必须在
 	// PrepareBody 之前注入——注入的档位也要走 normalizeReasoningEffort 降级管线
-	// （模型不支持所配档位时落到 ≤该档位的最高支持档，不出站非法档）。
+	// （模型不支持所配档位时落到 ≤ 该档位的最高支持档，不出站非法档）。
 	if ov := c.thinkingOverrideSnapshot(); ov != nil {
 		body = InjectDefaultThinkingEffort(body, ov)
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
+	body, in, out := PrepareBodyWithEffortTrace(body, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
-	return body
+	return body, in, out
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -1154,7 +1162,7 @@ func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 // global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
 // （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
+	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta, nil)
 }
 
 // ChatStreamContext 同 ChatStream，但从 ctx 派生请求 context：调用方（handler）传入
@@ -1174,11 +1182,15 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128；
 // #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
 // 反证，删了无回滚路径）。
-func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta, trace *EffortTrace) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	prepared, effortIn, effortOut := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	if trace != nil {
+		// Client 由调用方在注入前填好，这里绝不覆盖（它回答「客户端发了什么」）。
+		trace.In, trace.Out = effortIn, effortOut
+	}
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
@@ -1234,7 +1246,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+		// dump 旁路包在 monitorBody 外层：记录的是上游原始字节（不掐流、不改写，
+		// DumpDir 为空时原样返回，零开销）。
+		return c.dumpUpstream(monitorBody(resp.Body, c.IdleTimeout, cancel), prepared, a), resp.StatusCode, nil, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }

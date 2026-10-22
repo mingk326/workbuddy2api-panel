@@ -241,7 +241,7 @@ func (h *Handler) probeOnce(ctx context.Context, realm, model string, body []byt
 			break
 		}
 		tried[a.UID] = true
-		rc, _, _, err := h.cfg.Upstream.ChatStreamContext(ctx, a, body, "", upstream.ChatMeta{})
+		rc, _, _, err := h.cfg.Upstream.ChatStreamContext(ctx, a, body, "", upstream.ChatMeta{}, nil)
 		if err != nil {
 			lastErr = err
 			var ue *upstream.Error

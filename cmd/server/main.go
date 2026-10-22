@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.14.1-panel"
+const appVersion = "1.15.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -163,6 +163,13 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 上游原始报文旁路落盘（诊断用；空 = 关闭）。只在启动注入：热改需重启
+	// （避免与 chat 热路径并发读写竞争）。
+	up.DumpDir = cfg.Upstream.DumpDir
+	up.DumpRequestMax = cfg.Upstream.DumpRequestMax
+	if up.DumpDir != "" {
+		log.Printf("[upstream] dump 已启用：%s（请求体片段上限 %d 字节，单文件封顶 8MB）", up.DumpDir, cfg.Upstream.DumpRequestMax)
+	}
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
@@ -197,6 +204,10 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		// 账号级摊开：排程触发的账号遍历型任务每号在窗口内自己的偏移上执行
+		// （0 = 关闭，保持整点齐发现状）。
+		AccountSpreadMinutes:       cfg.Schedule.AccountSpreadMinutes,
+		AccountSpreadMinGapSeconds: cfg.Schedule.AccountSpreadMinGapSeconds,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -559,6 +570,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	// 账号级摊开热生效：下一轮排程任务即按新窗口执行（0 = 关闭）。
+	sch.SetAccountSpread(newCfg.Schedule.AccountSpreadMinutes, newCfg.Schedule.AccountSpreadMinGapSeconds)
 
 	return restartRequiredFields(newCfg), nil
 }
