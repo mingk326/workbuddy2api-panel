@@ -84,7 +84,7 @@ func (s *Scheduler) runTravel(scheduled bool) {
 	plan := s.spreadPlan(taskTravel, scheduled, time.Now())
 	ctx := s.runCtx()
 	first := true
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range plan.order(s.cfg.Pool.List()) {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if s.travelSkipReason(a, st.Disabled) != "" {
 			continue

@@ -90,7 +90,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 			}},
 		}},
 	}
-	if !sanitizeMessages(msgs) {
+	if !sanitizeMessages(msgs, true) {
 		t.Fatal("sanitizeMessages 未报告任何改动，tool_calls 被跳过")
 	}
 	fn := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
@@ -190,7 +190,7 @@ func TestMultimodalTextPartOnly(t *testing.T) {
 		map[string]any{"type": "text", "text": ccIdentity},
 		imgPart,
 	}
-	out, changed := sanitizeContent(content)
+	out, changed := sanitizeContent(content, true)
 	if !changed {
 		t.Fatal("expected change")
 	}
@@ -377,12 +377,59 @@ func TestSanitizeMessagesScrubsReasoningField(t *testing.T) {
 		"content":   "hi",
 		"reasoning": "upstream said 11128",
 	}}
-	if !sanitizeMessages(ms) {
+	if !sanitizeMessages(ms, true) {
 		t.Fatal("reasoning 字段里的指纹未被净化")
 	}
 	got, _ := ms[0].(map[string]any)["reasoning"].(string)
 	if strings.Contains(got, "11128") {
 		t.Fatalf("reasoning 仍含裸指纹: %q", got)
+	}
+}
+
+// TestBrandScopeIdentityOnly features.sanitize_brand_scope=identity：品牌词规则
+// 只作用于 system/developer，user/assistant 里的同名文本按用户数据原样透传。
+func TestBrandScopeIdentityOnly(t *testing.T) {
+	defer SetSanitizeBrandScope("all")
+	SetSanitizeBrandScope("identity")
+	if SanitizeBrandScopeAll() {
+		t.Fatal("identity 作用域下 SanitizeBrandScopeAll 应为 false")
+	}
+	ms := []any{
+		map[string]any{"role": "system", "content": "You are DeepSeek Harness."},
+		map[string]any{"role": "user", "content": "What is DeepSeek Harness?"},
+	}
+	if !sanitizeMessages(ms, SanitizeBrandScopeAll()) {
+		t.Fatal("system 消息里的品牌词应被净化")
+	}
+	if got := ms[0].(map[string]any)["content"].(string); strings.Contains(got, "DeepSeek Harness") {
+		t.Errorf("system 品牌词未净化: %q", got)
+	}
+	if got := ms[1].(map[string]any)["content"].(string); !strings.Contains(got, "DeepSeek Harness") {
+		t.Errorf("identity 作用域下 user 文本不应被改动: %q", got)
+	}
+}
+
+// TestBrandScopeAll features.sanitize_brand_scope=all（默认）：所有角色的品牌词都净化。
+func TestBrandScopeAll(t *testing.T) {
+	defer SetSanitizeBrandScope("")
+	SetSanitizeBrandScope("all")
+	if !SanitizeBrandScopeAll() {
+		t.Fatal("all 作用域下 SanitizeBrandScopeAll 应为 true")
+	}
+	ms := []any{
+		map[string]any{"role": "user", "content": "What is DeepSeek Harness?"},
+		map[string]any{"role": "assistant", "reasoning_content": "DeepSeek Harness is..."},
+	}
+	if !sanitizeMessages(ms, SanitizeBrandScopeAll()) {
+		t.Fatal("all 作用域下品牌词应被净化")
+	}
+	for i, m := range ms {
+		msg := m.(map[string]any)
+		for _, k := range []string{"content", "reasoning_content"} {
+			if s, ok := msg[k].(string); ok && strings.Contains(s, "DeepSeek Harness") {
+				t.Errorf("消息 %d 的 %s 品牌词未净化: %q", i, k, s)
+			}
+		}
 	}
 }
 

@@ -237,6 +237,9 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// SanitizeBrandScope 品牌词（身份类）规则作用域："all"（默认）= 所有消息角色；
+		// "identity" = 仅 system/developer（user/assistant/tool 里的同名文本按用户数据透传）。
+		SanitizeBrandScope string `json:"sanitize_brand_scope"`
 	} `json:"features"`
 
 	// Thinking 默认思考档位（出站注入）：空 = 不改写（与旧行为一致，尊重客户端显式档位
@@ -300,6 +303,15 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// ModelFallback 模型降级路由表：key = 客户端请求的模型（裸名），
+		// value = 该模型被 6004 模型级限流时改用的等价模型。
+		// 例：{"deepseek-v4.1-flash": "deepseek-v4-flash"}。
+		//
+		// 语义：等价模型是同一底层能力、只是计价不同；原模型被限流时改用另一个
+		// 继续服务（可用性优先），限流解除后自动回原模型（不写持久状态）。
+		// 只对 6004 生效；11102/11101/普通 429/5xx 都不降级。
+		// 缺省 nil = 不降级（对老配置零影响）。
+		ModelFallback map[string]string `json:"model_fallback"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -373,6 +385,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.SanitizeBrandScope = "all"
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -631,6 +644,22 @@ func (c *Config) normalize() error {
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
 	}
+	// 模型降级表：去空白、丢弃空值/自指条目（自指会让降级判断误以为配置了目标）。
+	if len(c.Pool.ModelFallback) > 0 {
+		cleaned := make(map[string]string, len(c.Pool.ModelFallback))
+		for k, v := range c.Pool.ModelFallback {
+			from := strings.TrimSpace(k)
+			to := strings.TrimSpace(v)
+			if from == "" || to == "" || from == to {
+				continue
+			}
+			cleaned[from] = to
+		}
+		if len(cleaned) == 0 {
+			cleaned = nil
+		}
+		c.Pool.ModelFallback = cleaned
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -721,6 +750,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	if err := c.normalizeAPIKeys(); err != nil {
+		return err
+	}
+	if err := c.normalizeFeatures(); err != nil {
 		return err
 	}
 	return c.normalizePrompt()
@@ -855,6 +887,20 @@ func (c *Config) EffectiveKeys() []httpauth.Key {
 func shortKeyHash(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])[:8]
+}
+
+// normalizeFeatures 归一化 features 段：品牌词作用域空值回落 "all"（保持旧行为），
+// 非法值 fail fast（静默回落会让用户以为收窄已生效，实际仍在改写用户数据）。
+func (c *Config) normalizeFeatures() error {
+	switch s := strings.ToLower(strings.TrimSpace(c.Features.SanitizeBrandScope)); s {
+	case "", "all":
+		c.Features.SanitizeBrandScope = "all"
+	case "identity":
+		c.Features.SanitizeBrandScope = "identity"
+	default:
+		return fmt.Errorf("features.sanitize_brand_scope: %q 不是合法值（all / identity）", c.Features.SanitizeBrandScope)
+	}
+	return nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

@@ -400,6 +400,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.dump_dir` | 空 | 上游原始报文旁路落盘目录（诊断用，空 = 关闭；也可用 `WB2A_DUMP_UPSTREAM`）。每次 chat 请求落一个文件：出站请求体 + 上游原始 SSE 字节，单文件封顶 8MB，写盘失败不影响请求。**正文含用户提示词**，仅在排障时临时开启；改动需重启 |
 | `upstream.dump_request_max` | `0` | 单个 dump 文件的请求体片段上限（字节），`0` = 默认 256 KiB。长会话的 tools 常排在几百条 messages 之后，可调大 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
+| `features.sanitize_brand_scope` | `all` | 身份类品牌词（`DeepSeek Harness`）改写的作用域：`all` = 所有消息角色；`identity` = 仅 system/developer（user / assistant / tool 里的同名文本按用户数据原样透传）。非法值启动报错；保存后热生效 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
@@ -677,7 +678,7 @@ http://127.0.0.1:7863/panel/
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
-`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
+`features.sanitize_brand_scope`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。

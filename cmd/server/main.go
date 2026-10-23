@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.15.0-panel"
+const appVersion = "1.15.1-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -153,6 +153,7 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	upstream.SetSanitizeBrandScope(cfg.Features.SanitizeBrandScope)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -254,6 +255,7 @@ func main() {
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
 		APIKeys:              cfg.EffectiveKeys(),
+		ModelFallback:        cfg.Pool.ModelFallback,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
@@ -343,10 +345,12 @@ func main() {
 		SoftCooldown: cfg.SoftRateDur,
 		Panel:        pn,
 		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		// 模型降级表经 livecfg 热生效（面板保存配置后下一请求即用新表）。
+		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
+		Usage:         rec,
+		RequestLog:    requestLog,
+		PromptMode:    cfg.Prompt.Mode,
+		PromptText:    cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
@@ -538,6 +542,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
 		APIKeys:              newCfg.EffectiveKeys(),
+		ModelFallback:        newCfg.Pool.ModelFallback,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
@@ -547,6 +552,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		BudgetCacheLowRate:     newCfg.Budget.CacheLowRate,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	// 品牌词作用域热生效：下一请求即按新作用域净化（包级 atomic，无锁读）。
+	upstream.SetSanitizeBrandScope(newCfg.Features.SanitizeBrandScope)
 	// thinking.* 热生效（与 sanitize 同一层：出站管线读的是 livecfg 快照之外的 Client 字段，
 	// 但 thinking 注入在 prepareBody 里按次读取，此处同步即可立即生效）。
 	up.SetThinkingOverride(newCfg.Thinking.DefaultEffort, newCfg.Thinking.PerModel)

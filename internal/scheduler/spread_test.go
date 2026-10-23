@@ -60,6 +60,31 @@ func TestNewAccountSpreadDisabled(t *testing.T) {
 	}
 }
 
+// TestAccountSpreadOrder 按计划时刻升序遍历（issue #45 塌缩修复）：
+// uid 序与计划序不一致时，不能按 uid 序阻塞执行。
+func TestAccountSpreadOrder(t *testing.T) {
+	now := time.Date(2026, 10, 22, 9, 0, 0, 0, cstZone)
+	p := newAccountSpread(taskCheckin, []string{"a", "b", "c"}, 30*time.Minute, 60*time.Second, now)
+	if p == nil {
+		t.Fatal("计划不应为空")
+	}
+	list := []pool.Status{{UID: "c"}, {UID: "a"}, {UID: "b"}}
+	got := p.order(list)
+	if len(got) != 3 {
+		t.Fatalf("len=%d", len(got))
+	}
+	for i := 1; i < len(got); i++ {
+		if p.at[got[i].UID].Before(p.at[got[i-1].UID]) {
+			t.Fatalf("顺序未按计划时刻升序: %v", []string{got[0].UID, got[1].UID, got[2].UID})
+		}
+	}
+	// 计划为 nil（未启用 / 手动触发）时原样返回。
+	var nilPlan *accountSpread
+	if got := nilPlan.order(list); len(got) != 3 || got[0].UID != "c" {
+		t.Errorf("nil plan 应原样返回: %+v", got)
+	}
+}
+
 // TestSpreadPlanManualSkips 手动触发不摊开；排程触发但池为空也不产生计划。
 func TestSpreadPlanManualSkips(t *testing.T) {
 	s := New(Config{Pool: pool.New(""), AccountSpreadMinutes: 30, AccountSpreadMinGapSeconds: 60})

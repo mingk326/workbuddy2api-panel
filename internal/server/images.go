@@ -4,7 +4,9 @@
 // 按 realm 前缀路由到对应账号池：
 //
 //	cn:hunyuan-image-alpha         国内版（实测 200 + 签名 COS URL）
-//	global:gpt-image-2.5-sunburst  国际版（混元在国际版无路由，回 14401）
+//	cn:hunyuan-image-alpha-edit    国内版图生图
+//	global:hy-image-3.5            国际版（2026-10-22 实测 200 + credit 0.27/张）
+//	global:gpt-image-2.5-sunburst  已下架（400 code=14401 route config not found）
 //
 // 请求体只把 model 换成裸名（前缀是网关路由协议，上游只认裸名），其余原样透传；
 // multipart 请求（OpenAI SDK 的 images.edit 走这条）就地转成上游要的 JSON。
@@ -68,6 +70,12 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		model = defaultImageModel
 	}
 	realm, bare := resolveModel(model)
+	// 已下架模型 → 直接 400 并指出替代（实测 14401 route config not found 会白烧每个账号）。
+	if upstream.ImageModelRetired(bare) {
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			fmt.Sprintf("%s 已被上游下架（14401 route config not found），请改用 hy-image-3.5 等现行模型", bare))
+		return
+	}
 	// 该模型在本域没有出图路由 → 直接 400，别打满全池（实测 14401 会白烧每个账号）。
 	if !upstream.ImageModelRoutable(bare, realm) {
 		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",

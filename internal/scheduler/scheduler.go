@@ -533,7 +533,7 @@ func (s *Scheduler) runCheckin(scheduled bool) {
 	plan := s.spreadPlan(taskCheckin, scheduled, time.Now())
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range plan.order(s.cfg.Pool.List()) {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -619,7 +619,7 @@ func (s *Scheduler) runActivity(ctx context.Context, scheduled bool) {
 	plan := s.spreadPlan(taskActivity, scheduled, time.Now())
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range plan.order(s.cfg.Pool.List()) {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -694,7 +694,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 func (s *Scheduler) runKeepalive(scheduled bool) {
 	plan := s.spreadPlan(taskKeepalive, scheduled, time.Now())
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range plan.order(s.cfg.Pool.List()) {
 		if st.Disabled && !includeDisabled {
 			continue
 		}

@@ -98,7 +98,7 @@ func PrepareBodyWithEffortTrace(src []byte, sanitize bool, efforts map[string][]
 	backfillReasoningContent(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
-			sanitizeMessages(msgs)
+			sanitizeMessages(msgs, SanitizeBrandScopeAll())
 		}
 	}
 	b, err := json.Marshal(obj)

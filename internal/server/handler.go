@@ -51,6 +51,11 @@ type Config struct {
 	// nil 时回退静态字段（测试与裸用场景）。
 	Live *livecfg.Holder
 
+	// ModelFallback 模型降级路由表（pool.model_fallback）：6004 模型级限流时
+	// 改用的等价模型（裸名 → 裸名）。nil = 不降级（老行为）。
+	// 热改：通常注入 func() map[string]string { return live.Load().ModelFallback }。
+	ModelFallback func() map[string]string
+
 	// PromptMode "custom"（网关用自有提示词替换 system）/ "passthrough"（透传）。
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
@@ -668,6 +673,49 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+
+	// 模型降级（pool.model_fallback）：curModel 是**本轮实际使用**的模型，初值 =
+	// 客户端请求的 bareModel；原模型被 6004 模型级限流、且配置了等价模型时，
+	// 同账号改用等价模型重试（curModel 改指向等价模型）。
+	//
+	// ⚠️ 与 bareModel 必须分开：降级后二者指向不同模型，用途不同——
+	//   - 实际用途（选号 / 出站 body / 结果提示）→ curModel
+	//   - 冷却记账（applyErrorPolicy 的 6004 分支）→ bareModel（限流的是原模型；
+	//     误记成等价模型会把本来好好的等价模型也冷却掉，降级就白做了）
+	curModel := bareModel
+	// fallbackTried 记录本请求已试过的降级目标，防 A→B→A 循环。
+	fallbackTried := map[string]bool{}
+	fallbackTo := func() string {
+		if h.cfg.ModelFallback == nil {
+			return ""
+		}
+		m := h.cfg.ModelFallback()
+		if m == nil {
+			return ""
+		}
+		to := strings.TrimSpace(m[curModel])
+		if to == "" || to == curModel || fallbackTried[to] {
+			return ""
+		}
+		return to
+	}
+	// applyFallback 把本轮模型切到等价模型，并重写出站 body 的顶层 model。
+	applyFallback := func(to string) bool {
+		if to == "" {
+			return false
+		}
+		fallbackTried[to] = true
+		curModel = to
+		var obj map[string]any
+		if json.Unmarshal(body, &obj) == nil {
+			obj["model"] = to
+			if nb, merr := json.Marshal(obj); merr == nil {
+				body = nb
+			}
+		}
+		return true
+	}
+
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -887,7 +935,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, curModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
@@ -898,16 +946,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			acct = h.cfg.Pool.PickExcludingForRealm(tried, curModel, realm)
 		}
 		if acct == nil {
+			// 模型降级兜底：全池该模型都处于 6004 冷却时 PickExcludingForRealm 直接
+			// 返回 nil——若只在上游返回 6004 后降级，这里会先报 503、根本走不到降级，
+			// 恰好在最需要降级的场景（全池被限流）失效。故选不到号时也尝试换模型。
+			if to := fallbackTo(); to != "" {
+				log.Printf("model fallback: %s -> %s (no account for model, 6004 blocked)", curModel, to)
+				if applyFallback(to) {
+					continue
+				}
+			}
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 			//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
 			//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
 			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 			// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
-			modelBlock = h.cfg.Pool.ModelBlocked(bareModel)
+			modelBlock = h.cfg.Pool.ModelBlockedForRealm(curModel, realm)
 			break
 		}
 		st.uid = acct.UID
@@ -1120,6 +1177,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 模型降级（pool.model_fallback）：**仅 6004 模型级限流**触发。
+			//
+			// 语义：等价模型是同一底层能力、只是计价不同；原模型被限流时改用另一个
+			// 继续服务，而不是让客户端等冷却结束。**同账号**换模型（不换号）。
+			// 只认 6004：11102（该后端无此模型）换模型也救不了；11101 / 普通 429 /
+			// 5xx 是账号级或瞬时问题，换模型无意义。
+			//
+			// 冷却必须记在 **bareModel**（原模型）名下：误记成等价模型会把本来好好的
+			// 等价模型也冷却掉，降级就白做了。
+			if kind == upstream.ErrSoftRate && upstream.IsModelRateLimit(string(respBody)) {
+				if to := fallbackTo(); to != "" {
+					if applyFallback(to) {
+						h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+						// 同账号重试：从 tried 移除（降级是「换模型」不是「换号」），
+						// 释放在途租约（下一次尝试会重新 Acquire）。
+						delete(tried, acct.UID)
+						releaseHeld()
+						log.Printf("model fallback: %s -> %s (6004 model rate limit, uid=%s)", bareModel, to, acct.UID)
+						continue
+					}
+				}
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -1191,7 +1270,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
 				st.outcome = reqlog.OutcomeInterrupted
 				h.cfg.Pool.NoteSuccess(acct.UID)
-				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+				h.cfg.Pool.BlockModelClear(acct.UID, curModel)
 				if sessKey != "" && h.cfg.Session != nil {
 					h.cfg.Session.Bind(sessKey, acct.UID)
 				}
@@ -1201,7 +1280,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+				h.cfg.Pool.BlockModelClear(acct.UID, curModel)
 				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 				if sessKey != "" && h.cfg.Session != nil {
@@ -1285,7 +1364,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.toks = completionTokens(resp)
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 		h.cfg.Pool.NoteSuccess(acct.UID)
-		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+		h.cfg.Pool.BlockModelClear(acct.UID, curModel)
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)
 		}
@@ -1697,16 +1776,24 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 func hasImagePart(body []byte) bool {
 	var peek struct {
 		Messages []struct {
-			Content []struct {
-				Type string `json:"type"`
-			} `json:"content"`
+			// Content 用 RawMessage：system / 历史消息的 content 是字符串，
+			// tool_calls 消息可能是 null。若直接反序列化成 []part，任何一条
+			// 非数组 content 都会让整个 Unmarshal 失败 → 带图请求被漏判
+			// （mixed content 实测：系统提示 + 用户带图）。
+			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
 	if json.Unmarshal(body, &peek) != nil {
 		return false
 	}
 	for _, m := range peek.Messages {
-		for _, p := range m.Content {
+		var parts []struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(m.Content, &parts) != nil {
+			continue // 字符串 / null / 其他形态：本消息没有 part 数组
+		}
+		for _, p := range parts {
 			if p.Type == "image_url" {
 				return true
 			}

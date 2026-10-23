@@ -30,6 +30,10 @@ type Snapshot struct {
 	BudgetDailyCreditLimit float64 // 当日累计 credit 上限
 	BudgetBurstCreditLimit float64 // 5 分钟窗口内累计 credit 上限
 	BudgetCacheLowRate     float64 // 连续低缓存率触发阈值（百分比）
+
+	// ModelFallback 模型降级路由表（pool.model_fallback）：6004 模型级限流时
+	// 改用的等价模型（裸名 → 裸名）。nil = 不降级。
+	ModelFallback map[string]string
 }
 
 // Keys 返回生效密钥表：优先 APIKeys；为空时把旧版 APIKey 合成为 admin 身份。
@@ -73,6 +77,13 @@ func (h *Holder) Load() Snapshot {
 // 再次 normalize），若共享底层 PerModel，读方会在无锁状态读到并发写。
 func (h *Holder) Store(s Snapshot) {
 	s.APIKeys = cloneKeys(s.APIKeys)
+	if len(s.ModelFallback) > 0 {
+		m := make(map[string]string, len(s.ModelFallback))
+		for k, v := range s.ModelFallback {
+			m[k] = v
+		}
+		s.ModelFallback = m
+	}
 	h.p.Store(&s)
 }
 

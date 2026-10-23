@@ -99,7 +99,8 @@
     "dump_request_max": 0
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "sanitize_brand_scope": "all"
   },
   "prompt": {
     "mode": "passthrough",

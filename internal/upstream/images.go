@@ -44,13 +44,32 @@ func (c *Client) ImageEdits(a *auth.Auth, body any) (json.RawMessage, error) {
 //
 // 为什么需要：列进 /v1/models 等于引诱客户端选一个必然失败的模型（客户端枚举列表
 // 即踩）。未知模型照旧列出（不猜）。
+//
+// 2026-10-22 复测（两个个人号直连上游）：
+//
+//	cn:hunyuan-image-alpha      200 → usage{output_image_coefficient:1, credit:5.71}
+//	global:hy-image-3.5         200 → usage{output_image_tokens:15000, credit:0.27}
+//	global:gpt-image-2.5-sunburst → 400 code=14401 route config not found（已下架）
 var imageRouteRealm = map[string]string{
-	"hunyuan-image-alpha":    "cn",
-	"gpt-image-2.5-sunburst": "global",
+	"hunyuan-image-alpha":      "cn",
+	"hunyuan-image-alpha-edit": "cn",
+	"hy-image-3.5":             "global",
 }
+
+// imageDeadModels 上游已下架、两个域都没有路由的出图模型：列出来只会让客户端
+// 选到一个必然 400 的模型。只写实测下架的；模型回来时删一行即可。
+var imageDeadModels = map[string]bool{
+	"gpt-image-2.5-sunburst": true,
+}
+
+// ImageModelRetired 报告该图像模型是否已被上游下架（实测 14401 route config not found）。
+func ImageModelRetired(model string) bool { return imageDeadModels[model] }
 
 // ImageModelRoutable 报告该图像模型在给定域是否有路由（未知模型视为可路由，不猜）。
 func ImageModelRoutable(model, realm string) bool {
+	if imageDeadModels[model] {
+		return false
+	}
 	if r, known := imageRouteRealm[model]; known {
 		return r == realm
 	}
