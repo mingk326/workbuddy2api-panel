@@ -23,7 +23,7 @@ func TestKeyAllowedModelsChat(t *testing.T) {
 	up := thinkingOverrideUpstream(&bodies)
 	live := livecfg.New(livecfg.Snapshot{APIKeys: []httpauth.Key{
 		{ID: "admin", Secret: "sk-admin", Admin: true},
-		{ID: "codex", Secret: "sk-codex", AllowedModels: []string{"glm-5.2"}},
+		{ID: "codex", Secret: "sk-codex", Name: "codex", AllowedModels: []string{"glm-5.2"}},
 		{ID: "cn-only", Secret: "sk-cn", AllowedModels: []string{"cn:glm-5.2"}},
 	}})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
@@ -76,6 +76,9 @@ func TestKeyAllowedModelsChat(t *testing.T) {
 	}
 	if rejected.Model != "kimi-k3" || rejected.Outcome != reqlog.OutcomeHTTPError || (rejected.Account != "" && rejected.Account != "-") {
 		t.Errorf("403 事件上下文不完整: %+v", *rejected)
+	}
+	if rejected.KeyID != "codex" || rejected.KeyName != "codex" {
+		t.Errorf("403 事件缺密钥身份: key_id=%q key_name=%q", rejected.KeyID, rejected.KeyName)
 	}
 
 	// 3) 裸名条目跨域生效：global:glm-5.2 不应被 403（无 global 号时可能是 503）。

@@ -371,11 +371,16 @@ func uidPrefix(uid string) string {
 
 type requestTraceKey struct{}
 
-// requestTrace 在一次 chat 请求内共享标识与最终统计，ServeHTTP 出口统一记账。
+// requestTrace 在一次模型请求内共享标识与最终统计，ServeHTTP 出口统一记账。
 type requestTrace struct {
 	id    string
 	start time.Time
-	stat  *chatStat
+	// path 入站路径（/v1/chat/completions / /v1/messages / /messages / /v1/responses）。
+	path string
+	stat *chatStat
+	// 命中的 API 密钥身份（鉴权中间件回填；401 时为空）。
+	keyID   string
+	keyName string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -431,8 +436,13 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      t.path,
+		KeyID:     t.keyID,
+		KeyName:   t.keyName,
 		Status:    status,
+	}
+	if e.Path == "" {
+		e.Path = "/v1/chat/completions" // 兜底：手工构造的 trace（测试）
 	}
 	duration := time.Since(t.start)
 	e.DurationMs = duration.Milliseconds()

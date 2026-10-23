@@ -38,6 +38,7 @@ func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
 			return
 		}
+		noteTraceKey(r, key)
 		next(w, withAuthKey(r, key))
 	}
 }

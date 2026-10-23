@@ -14,6 +14,7 @@ func TestArchivePersistsEffort(t *testing.T) {
 	r.Record(Event{
 		Time: time.Now(), RequestID: "req-effort", Model: "glm-5.3",
 		Status: 200, OK: true, Outcome: OutcomeSuccess, Effort: "gw:max->xhigh",
+		KeyID: "key-ef797c81", KeyName: "codex",
 	})
 	r.Close()
 	rows, err := r.ReadArchive(10, Filter{})
@@ -22,6 +23,9 @@ func TestArchivePersistsEffort(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Effort != "gw:max->xhigh" {
 		t.Fatalf("effort roundtrip = %+v", rows)
+	}
+	if rows[0].KeyID != "key-ef797c81" || rows[0].KeyName != "codex" {
+		t.Fatalf("key identity roundtrip = (%q,%q)", rows[0].KeyID, rows[0].KeyName)
 	}
 }
 

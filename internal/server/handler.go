@@ -212,8 +212,8 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && requestLoggablePath(r.URL.Path) {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
@@ -232,6 +232,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// requestLoggablePath 需要写入请求记录的入站模型入口。
+//
+// 三个协议入口在网关内部都会汇入 chatCompletions，但 ServeHTTP 这层包装决定
+// 是否创建 requestTrace；此前只匹配 /v1/chat/completions，导致 Claude Code
+// （/v1/messages）与 Codex（/v1/responses）的调用完全不出现在请求记录里。
+func requestLoggablePath(path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/v1/messages", "/messages", "/v1/responses":
+		return true
+	}
+	return false
+}
+
+// noteTraceKey 把命中的密钥身份记到 requestTrace（请求记录用；不含密钥明文）。
+// 401（无效密钥）走不到这里，记录里保持为空。
+func noteTraceKey(r *http.Request, k httpauth.Key) {
+	if tr := requestTraceFrom(r); tr != nil {
+		tr.keyID, tr.keyName = k.ID, k.Name
+	}
 }
 
 // authKeyCtxKey 已认证密钥在请求上下文中的键。
@@ -259,6 +280,7 @@ func (h *Handler) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusForbidden, "admin_required", "this endpoint requires an admin API key")
 			return
 		}
+		noteTraceKey(r, key)
 		next(w, withAuthKey(r, key))
 	}
 }
@@ -297,6 +319,7 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
+		noteTraceKey(r, key)
 		next(w, withAuthKey(r, key))
 	}
 }

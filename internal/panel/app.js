@@ -880,13 +880,14 @@ function renderRequestMetrics(m, entries) {
   renderRequestTable();
 }
 
-/* reqMatch 请求记录筛选：q 对 IP/UA/模型/档位/账号/请求 ID 做空格分词的 AND 包含匹配，
+/* reqMatch 请求记录筛选：q 对 IP/UA/模型/档位/密钥/账号/请求 ID 做空格分词的 AND 包含匹配，
    outcome 精确匹配。两者都在已拉取的条目上做（最多 1000 条），不发新请求。 */
 function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.effort, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.effort,
+      e && e.key_id, e && e.key_name, e && e.account, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -916,6 +917,19 @@ function reqCreditCell(e) {
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
 }
 
+// 密钥展示名：备注名优先，回落到 ID（legacy → 「旧版 api_key」由服务端 Name 提供）。
+function reqKeyLabel(e) {
+  return e ? (e.key_name || e.key_id || '') : '';
+}
+
+// 密钥单元格：完整身份（名称 + ID）放 tooltip，行内只显示名称/ID。
+function reqKeyCell(e) {
+  const label = reqKeyLabel(e);
+  if (!label) return '<span class="muted">—</span>';
+  const full = (e.key_name || '') + (e.key_id ? (e.key_name ? ' (' + e.key_id + ')' : e.key_id) : '');
+  return '<span class="clip" title="' + esc(full) + '">' + esc(label) + '</span>';
+}
+
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
 function renderRequestTable() {
@@ -932,6 +946,7 @@ function renderRequestTable() {
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + (e && e.effort ? esc(e.effort) : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + reqKeyCell(e) + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -940,7 +955,7 @@ function renderRequestTable() {
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="11" class="empty">' +
+  }).join('') || '<tr><td colspan="12" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;
@@ -986,6 +1001,7 @@ function requestLogText(e) {
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
     e && e.effort || '',
+    e && (e.key_name || e.key_id) || '',
     e && e.account || '—',
     e && e.client_ip || '—',
     e && e.user_agent || '—',
