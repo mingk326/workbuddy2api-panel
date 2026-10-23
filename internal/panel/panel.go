@@ -25,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -62,6 +63,8 @@ type Config struct {
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
+	// KeyQuota 密钥级每日用量（nil = 密钥列表不显示今日用量）。
+	KeyQuota *keyquota.Tracker
 	// CreditHist 积分变动流水（nil = /panel/api/credit_history 返回 501）。
 	// 手工刷新 / 签到时也会追加流水，与 scheduler 共用同一账本。
 	CreditHist *credithist.Ledger

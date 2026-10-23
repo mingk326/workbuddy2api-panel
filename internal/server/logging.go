@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -70,6 +71,11 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// 密钥级每日配额：keyID 为空（未鉴权）或 keyQuota 为 nil 时不累计。
+	// 只在 chat 路径赋值；出图按产品决定不计入配额。
+	keyID    string
+	keyQuota *keyquota.Tracker
+
 	// 思考档位溯源（issue #43）：client 为客户端原始档位（任何注入之前），
 	// in 为出站管线降级前、out 为最终出站。渲染规则见 effortLabel。
 	effortClient string
@@ -101,10 +107,19 @@ func (s *chatStat) done() {
 	logChatRowFull(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks,
 		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent,
 		effortLabel(s.effortClient, s.effortIn, s.effortOut))
-	// 积分闸只吃**观测到的**值：credit 缺失不按 0 计（否则会把闸门当"免费"放行），
+	// 积分闸只吃**观测到的**值：credit 缺失不按 0 计（否则会把闸门当"免费"放行）；
 	// 缓存字段缺失不参与命中率判定（模型不报缓存 ≠ 零命中）。
 	s.budget.add(s.credit, s.hasCredit)
 	s.budget.observeCache(s.cacheHit, s.cacheMiss, s.hasCache)
+	// 密钥每日 Token 配额：口径与请求记录一致（total_tokens 优先，缺失回落
+	// prompt+completion）；上游没回 usage 的请求不计 token（请求数在准入时已计）。
+	if s.keyQuota != nil && s.keyID != "" {
+		tokens := s.totalTokens
+		if tokens <= 0 {
+			tokens = s.promptTokens + s.completionTokens
+		}
+		s.keyQuota.AddTokens(s.keyID, tokens)
+	}
 	noteProm(s, total)
 }
 

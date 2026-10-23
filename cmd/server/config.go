@@ -36,6 +36,10 @@ type APIKeyEntry struct {
 	// AllowedModels 可用模型白名单：空 = 不限制；裸名（"glm-5.3"）对 cn/global
 	// 两个域都生效，带域前缀（"global:hy-image-3.5"）只限定该域。
 	AllowedModels []string `json:"allowed_models,omitempty"`
+	// DailyTokenLimit 每日 Token 上限（输入+输出，CST 自然日）；0 = 不限制。
+	DailyTokenLimit int64 `json:"daily_token_limit,omitempty"`
+	// DailyRequestLimit 每日模型请求数上限（CST 自然日）；0 = 不限制。
+	DailyRequestLimit int64 `json:"daily_request_limit,omitempty"`
 }
 
 // Config 顶层配置。
@@ -875,6 +879,14 @@ func (c *Config) normalizeAPIKeys() error {
 			return err
 		}
 		k.AllowedModels = normalizeAllowedModels(k.AllowedModels)
+		// 负数一律 fail fast：配额写负值通常是想写 0（不限制）或漏了数字，
+		// 静默钳成 0 会让用户在不知情的情况下失去限制。
+		if k.DailyTokenLimit < 0 {
+			return fmt.Errorf("api_keys[id=%s].daily_token_limit: 不能为负（0 = 不限制）", k.ID)
+		}
+		if k.DailyRequestLimit < 0 {
+			return fmt.Errorf("api_keys[id=%s].daily_request_limit: 不能为负（0 = 不限制）", k.ID)
+		}
 		anyAdmin = anyAdmin || k.Admin
 		out = append(out, k)
 	}
@@ -891,13 +903,15 @@ func (c *Config) EffectiveKeys() []httpauth.Key {
 	out := make([]httpauth.Key, 0, len(c.APIKeys)+1)
 	for _, k := range c.APIKeys {
 		out = append(out, httpauth.Key{
-			ID:            k.ID,
-			Secret:        k.Key,
-			Name:          k.Name,
-			Admin:         k.Admin,
-			DefaultEffort: k.DefaultEffort,
-			PerModel:      k.PerModel,
-			AllowedModels: k.AllowedModels,
+			ID:                k.ID,
+			Secret:            k.Key,
+			Name:              k.Name,
+			Admin:             k.Admin,
+			DefaultEffort:     k.DefaultEffort,
+			PerModel:          k.PerModel,
+			AllowedModels:     k.AllowedModels,
+			DailyTokenLimit:   k.DailyTokenLimit,
+			DailyRequestLimit: k.DailyRequestLimit,
 		})
 	}
 	if c.APIKey != "" {

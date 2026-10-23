@@ -19,6 +19,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -32,7 +33,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.15.3-panel"
+const appVersion = "1.15.4-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -284,10 +285,17 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// 密钥级每日配额（Token / 请求数）：计数落盘，重启不丢；日界 CST 00:00。
+	keyQuotaPath := stateSibling(cfg.StateFile, "key-usage.json")
+	keyQuota := keyquota.New(keyQuotaPath)
+	defer keyQuota.Close()
+	log.Printf("[keyquota] 密钥每日用量统计已启用: %s", keyQuotaPath)
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
 		RequestLog:  requestLog,
+		KeyQuota:    keyQuota,
 		CreditHist:  creditHist,
 		Upstream:    up,
 		Scheduler:   sch,
@@ -349,6 +357,7 @@ func main() {
 		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
 		Usage:         rec,
 		RequestLog:    requestLog,
+		KeyQuota:      keyQuota,
 		PromptMode:    cfg.Prompt.Mode,
 		PromptText:    cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的

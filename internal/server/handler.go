@@ -18,6 +18,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -74,6 +75,10 @@ type Config struct {
 
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
+
+	// KeyQuota 密钥级每日用量统计/配额（可选；nil = 不启用）。
+	// Token 在请求完成后累计，请求数在通过配额检查时累计（见 keyquota 包）。
+	KeyQuota *keyquota.Tracker
 
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
@@ -686,12 +691,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+	// 密钥身份：白名单、每日配额、档位注入共用同一次解析。
+	authKey, hasAuthKey := authKeyFrom(r.Context())
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。必须在密钥白名单
 	// 拒绝之前创建——否则 403 的流水行/请求记录里 model 为空，排障时分不清
 	// 「哪个模型被拒」，只能看到一条无上下文的 403。
 	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
 	st.effortClient = effortTrace.Client
+	if hasAuthKey {
+		st.keyID = authKey.ID
+	}
+	st.keyQuota = h.cfg.KeyQuota
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -702,13 +713,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 密钥级模型白名单：名单外模型直接 403，不选号、不打上游、不扣额度。
 	// 未鉴权部署（密钥表为空）没有密钥身份 → 视为不限制；密钥名单为空同样不限制。
-	authKey, hasAuthKey := authKeyFrom(r.Context())
 	if bareModel != "" && !authKey.AllowsModel(realm, bareModel) {
 		// 先落状态再拒绝：st.done() 的流水行与 requestTrace.event 的归档事件
 		// 都从 st 取状态，这样 403 会带着请求模型出现在两处。
 		st.status = http.StatusForbidden
 		modelNotAllowed(w, peek.Model, authKey.AllowedModels)
 		return
+	}
+
+	// 密钥级每日配额（CST 自然日）：Token 与请求数两个维度，0 = 该维度不限制。
+	// 通过时请求数 +1；Token 在请求结束、拿到 usage 后由 st.done() 累计。
+	if hasAuthKey && h.cfg.KeyQuota != nil && authKey.ID != "" {
+		if d := h.cfg.KeyQuota.Admit(authKey.ID, authKey.DailyTokenLimit, authKey.DailyRequestLimit); !d.OK {
+			st.status = http.StatusTooManyRequests
+			writeKeyQuotaExceeded(w, d)
+			return
+		}
 	}
 
 	// 模型降级（pool.model_fallback）：curModel 是**本轮实际使用**的模型，初值 =

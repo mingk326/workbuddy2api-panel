@@ -31,6 +31,9 @@ type panelKey struct {
 	// AllowedModels 可用模型白名单：空 = 不限制；裸名对所有域生效，
 	// 带 cn:/global: 前缀只限定该域（与 httpauth.Key.AllowsModel 同口径）。
 	AllowedModels []string `json:"allowed_models,omitempty"`
+	// DailyTokenLimit / DailyRequestLimit 每日配额（CST 自然日）；0 = 不限制。
+	DailyTokenLimit   int64 `json:"daily_token_limit,omitempty"`
+	DailyRequestLimit int64 `json:"daily_request_limit,omitempty"`
 }
 
 // keyView 列表展示项（密钥脱敏，绝不回传完整值）。
@@ -43,25 +46,34 @@ type keyView struct {
 	DefaultEffort string            `json:"thinking_default_effort"`
 	PerModel      map[string]string `json:"thinking_per_model,omitempty"`
 	AllowedModels []string          `json:"allowed_models"`
+	// 每日配额与今日用量（CST 自然日；用量来自 keyquota，0 = 尚无记录）。
+	DailyTokenLimit   int64 `json:"daily_token_limit"`
+	DailyRequestLimit int64 `json:"daily_request_limit"`
+	TodayTokens       int64 `json:"today_tokens"`
+	TodayRequests     int64 `json:"today_requests"`
 }
 
 type keyUpsertReq struct {
-	ID            string            `json:"id"`
-	Key           string            `json:"key"` // 新增时可选：空 = 自动生成
-	Name          string            `json:"name"`
-	Admin         bool              `json:"admin"`
-	DefaultEffort string            `json:"thinking_default_effort"`
-	PerModel      map[string]string `json:"thinking_per_model"`
-	AllowedModels []string          `json:"allowed_models"`
+	ID                string            `json:"id"`
+	Key               string            `json:"key"` // 新增时可选：空 = 自动生成
+	Name              string            `json:"name"`
+	Admin             bool              `json:"admin"`
+	DefaultEffort     string            `json:"thinking_default_effort"`
+	PerModel          map[string]string `json:"thinking_per_model"`
+	AllowedModels     []string          `json:"allowed_models"`
+	DailyTokenLimit   int64             `json:"daily_token_limit"`
+	DailyRequestLimit int64             `json:"daily_request_limit"`
 }
 
 type keyUpdateReq struct {
-	ID            string            `json:"id"`
-	Name          *string           `json:"name"`
-	Admin         *bool             `json:"admin"`
-	DefaultEffort *string           `json:"thinking_default_effort"`
-	PerModel      map[string]string `json:"thinking_per_model"` // nil = 不改；{} = 清空
-	AllowedModels []string          `json:"allowed_models"`     // nil = 不改；[] = 清空（= 不限制）
+	ID                string            `json:"id"`
+	Name              *string           `json:"name"`
+	Admin             *bool             `json:"admin"`
+	DefaultEffort     *string           `json:"thinking_default_effort"`
+	PerModel          map[string]string `json:"thinking_per_model"`  // nil = 不改；{} = 清空
+	AllowedModels     []string          `json:"allowed_models"`      // nil = 不改；[] = 清空（= 不限制）
+	DailyTokenLimit   *int64            `json:"daily_token_limit"`   // nil = 不改；0 = 不限制
+	DailyRequestLimit *int64            `json:"daily_request_limit"` // nil = 不改；0 = 不限制
 }
 
 type keyDeleteReq struct {
@@ -85,15 +97,19 @@ func (p *Panel) keysList(w http.ResponseWriter, r *http.Request) {
 	legacy := stringField(m, "api_key")
 	views := make([]keyView, 0, len(keys)+1)
 	for _, k := range keys {
+		tok, req := p.keyUsage(k.ID)
 		views = append(views, keyView{
 			ID: k.ID, Name: k.Name, Masked: maskKey(k.Key), Admin: k.Admin,
 			DefaultEffort: k.DefaultEffort, PerModel: k.PerModel, AllowedModels: k.AllowedModels,
+			DailyTokenLimit: k.DailyTokenLimit, DailyRequestLimit: k.DailyRequestLimit,
+			TodayTokens: tok, TodayRequests: req,
 		})
 	}
 	if legacy != "" {
+		tok, req := p.keyUsage("legacy")
 		views = append(views, keyView{
 			ID: "legacy", Name: "旧版 api_key（config.api_key）", Masked: maskKey(legacy),
-			Admin: true, Legacy: true,
+			Admin: true, Legacy: true, TodayTokens: tok, TodayRequests: req,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -124,6 +140,10 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(secret) < 8 {
 		writeErr(w, http.StatusBadRequest, "密钥长度至少 8 个字符")
+		return
+	}
+	if req.DailyTokenLimit < 0 || req.DailyRequestLimit < 0 {
+		writeErr(w, http.StatusBadRequest, "每日配额不能为负（0 = 不限制）")
 		return
 	}
 
@@ -161,9 +181,11 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	entry := panelKey{
 		ID: id, Key: secret, Name: strings.TrimSpace(req.Name), Admin: req.Admin,
-		DefaultEffort: strings.ToLower(strings.TrimSpace(req.DefaultEffort)),
-		PerModel:      normalizeEffortMap(req.PerModel),
-		AllowedModels: normalizeModelList(req.AllowedModels),
+		DefaultEffort:     strings.ToLower(strings.TrimSpace(req.DefaultEffort)),
+		PerModel:          normalizeEffortMap(req.PerModel),
+		AllowedModels:     normalizeModelList(req.AllowedModels),
+		DailyTokenLimit:   req.DailyTokenLimit,
+		DailyRequestLimit: req.DailyRequestLimit,
 	}
 	keys = append(keys, entry)
 	if err := p.saveKeys(m, keys); err != nil {
@@ -171,10 +193,12 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":    true,
-		"id":    id,
-		"key":   secret, // 唯一一次回显完整密钥
-		"entry": keyView{ID: id, Name: entry.Name, Masked: maskKey(secret), Admin: entry.Admin, DefaultEffort: entry.DefaultEffort, PerModel: entry.PerModel, AllowedModels: entry.AllowedModels},
+		"ok":  true,
+		"id":  id,
+		"key": secret, // 唯一一次回显完整密钥
+		"entry": keyView{ID: id, Name: entry.Name, Masked: maskKey(secret), Admin: entry.Admin,
+			DefaultEffort: entry.DefaultEffort, PerModel: entry.PerModel, AllowedModels: entry.AllowedModels,
+			DailyTokenLimit: entry.DailyTokenLimit, DailyRequestLimit: entry.DailyRequestLimit},
 	})
 }
 
@@ -229,6 +253,21 @@ func (p *Panel) keysUpdate(w http.ResponseWriter, r *http.Request) {
 	// nil = 不改；[]（显式空数组）= 清空白名单 = 不限制。
 	if req.AllowedModels != nil {
 		keys[idx].AllowedModels = normalizeModelList(req.AllowedModels)
+	}
+	// nil = 不改；0 = 恢复不限制。负数拒绝（与启动校验同口径）。
+	if req.DailyTokenLimit != nil {
+		if *req.DailyTokenLimit < 0 {
+			writeErr(w, http.StatusBadRequest, "每日 Token 上限不能为负（0 = 不限制）")
+			return
+		}
+		keys[idx].DailyTokenLimit = *req.DailyTokenLimit
+	}
+	if req.DailyRequestLimit != nil {
+		if *req.DailyRequestLimit < 0 {
+			writeErr(w, http.StatusBadRequest, "每日请求数上限不能为负（0 = 不限制）")
+			return
+		}
+		keys[idx].DailyRequestLimit = *req.DailyRequestLimit
 	}
 	if !hasAdmin(stringField(m, "api_key"), keys) {
 		writeErr(w, http.StatusBadRequest, "至少保留一把管理员密钥（admin=true），否则面板将无法登录")
@@ -372,6 +411,14 @@ func normalizeEffortMap(in map[string]string) map[string]string {
 		out[model] = effort
 	}
 	return out
+}
+
+// keyUsage 返回该密钥今日已用 (tokens, requests)；未接线或尚无记录时为 0。
+func (p *Panel) keyUsage(id string) (tokens, requests int64) {
+	if p.cfg.KeyQuota == nil || id == "" {
+		return 0, 0
+	}
+	return p.cfg.KeyQuota.Snapshot(id)
 }
 
 // normalizeModelList 归一化可用模型白名单：去空白、去重、保序；空 = nil（不限制）。

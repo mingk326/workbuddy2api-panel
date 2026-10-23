@@ -15,7 +15,9 @@
         "glm-5.3",
         "deepseek-v4.1-flash",
         "global:hy-image-3.5"
-      ]
+      ],
+      "daily_token_limit": 2000000,
+      "daily_request_limit": 1000
     }
   ],
   "auth_dir": "./auths",

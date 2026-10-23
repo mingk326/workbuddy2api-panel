@@ -1186,6 +1186,16 @@ function splitModels(v) {
   return String(v || '').split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
 }
 
+// 今日用量 / 配额列：limit=0 显示「不限」；用量来自服务端 keyquota。
+function quotaCell(k) {
+  const tl = Number(k.daily_token_limit || 0), rl = Number(k.daily_request_limit || 0);
+  const tu = Number(k.today_tokens || 0), ru = Number(k.today_requests || 0);
+  const t = fmtTok(tu) + ' / ' + (tl > 0 ? fmtTok(tl) : '不限');
+  const r = ru + ' / ' + (rl > 0 ? rl : '不限');
+  const title = 'Token ' + tu + ' / ' + (tl > 0 ? tl : '不限') + ' · 请求 ' + ru + ' / ' + (rl > 0 ? rl : '不限');
+  return '<span title="' + esc(title) + '">tok ' + t + '<br>req ' + r + '</span>';
+}
+
 // 勾选框回填：输入框里的裸名等价于「两个域都允许」，对应域条目也显示为已选。
 function syncKeyModelChecks() {
   const box = $('keyModelsList');
@@ -1205,7 +1215,7 @@ async function loadKeys() {
     const keys = d.keys || [];
     $('keysNote').textContent = d.auth_required ? keys.length + ' 把密钥' : '未启用鉴权';
     if (!keys.length) {
-      tb.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">尚未配置密钥</div>当前网关无需鉴权；新增一把管理员密钥即可开启鉴权</div></td></tr>';
+      tb.innerHTML = '<tr><td colspan="8"><div class="empty"><div class="big">尚未配置密钥</div>当前网关无需鉴权；新增一把管理员密钥即可开启鉴权</div></td></tr>';
       return;
     }
     tb.innerHTML = keys.map(k => {
@@ -1220,6 +1230,7 @@ async function loadKeys() {
         '<td><code>' + esc(k.masked) + '</code></td>' +
         '<td>' + (k.admin ? '管理员' : '普通') + '</td>' +
         '<td>' + modelsCell(k.allowed_models) + '</td>' +
+        '<td>' + quotaCell(k) + '</td>' +
         '<td>' + effortText(k.thinking_default_effort) + '</td>' +
         '<td>' + per + '</td>' +
         '<td class="num">' + ops + '</td></tr>';
@@ -1232,7 +1243,7 @@ async function loadKeys() {
       };
     });
   } catch (e) {
-    tb.innerHTML = '<tr><td colspan="7">读取失败：' + esc(e.message) + '</td></tr>';
+    tb.innerHTML = '<tr><td colspan="8">读取失败：' + esc(e.message) + '</td></tr>';
   }
 }
 
@@ -1248,6 +1259,8 @@ function openKeyForm(k) {
   $('keyEffort').value = k ? (k.thinking_default_effort || '') : '';
   $('keyPerModel').value = k && k.thinking_per_model ? JSON.stringify(k.thinking_per_model) : '';
   $('keyModels').value = k && Array.isArray(k.allowed_models) ? k.allowed_models.join(', ') : '';
+  $('keyDailyTokens').value = k && k.daily_token_limit ? String(k.daily_token_limit) : '';
+  $('keyDailyRequests').value = k && k.daily_request_limit ? String(k.daily_request_limit) : '';
   $('keyModelsPick').hidden = true;
   $('keyModelsFilter').value = '';
   $('keyAdmin').checked = k ? !!k.admin : false;
@@ -1280,6 +1293,9 @@ $('btnKeySave').onclick = async () => {
     thinking_per_model: per,
     // 总是下发：空数组 = 清空（不限制）；编辑时输入框已回填现值，不会误清。
     allowed_models: splitModels($('keyModels').value),
+    // 0 / 空 = 不限制；空串 Number('')=0，正好符合语义。
+    daily_token_limit: Number($('keyDailyTokens').value) || 0,
+    daily_request_limit: Number($('keyDailyRequests').value) || 0,
   };
   const btn = $('btnKeySave');
   btn.disabled = true; btn.textContent = '保存中…';

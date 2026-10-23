@@ -32,6 +32,27 @@ func TestAPIKeysAllowedModelsNormalized(t *testing.T) {
 	}
 }
 
+// TestAPIKeysDailyQuota 每日配额透传到运行期密钥表；负值 fail fast。
+func TestAPIKeysDailyQuota(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"api_keys":[{"key":"sk-a","admin":true,
+		"daily_token_limit":1000,"daily_request_limit":10}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := c.EffectiveKeys()
+	if len(keys) != 1 || keys[0].DailyTokenLimit != 1000 || keys[0].DailyRequestLimit != 10 {
+		t.Fatalf("effective keys = %+v", keys)
+	}
+	for _, body := range []string{
+		`{"api_keys":[{"key":"sk-a","admin":true,"daily_token_limit":-1}]}`,
+		`{"api_keys":[{"key":"sk-a","admin":true,"daily_request_limit":-1}]}`,
+	} {
+		if _, err := ParseConfig([]byte(body)); err == nil {
+			t.Errorf("negative quota should fail fast: %s", body)
+		}
+	}
+}
+
 // TestLegacyKeyUnrestricted 旧版 api_key 没有白名单 → 不限制（零回归）。
 func TestLegacyKeyUnrestricted(t *testing.T) {
 	c, err := ParseConfig([]byte(`{"api_key":"sk-legacy"}`))

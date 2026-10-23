@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 )
 
@@ -24,6 +25,7 @@ func testKeysPanel(t *testing.T, initial string) (*Panel, string) {
 		Version:    "test",
 		APIKey:     "sk-legacy",
 		ConfigPath: path,
+		KeyQuota:   keyquota.New(""),
 		SaveConfig: func(raw []byte) ([]string, error) {
 			return nil, os.WriteFile(path, raw, 0o600)
 		},
@@ -87,7 +89,8 @@ func TestKeysCRUD(t *testing.T) {
 	// 创建：留空密钥自动生成，完整值只在响应里出现一次。
 	rec = doPanel(p, "POST", "/panel/api/keys", "sk-legacy",
 		`{"name":"codex","thinking_default_effort":"max","thinking_per_model":{"glm-5.2":"low"},
-		  "allowed_models":[" glm-5.2 ","glm-5.2","","global:hy3"]}`)
+		  "allowed_models":[" glm-5.2 ","glm-5.2","","global:hy3"],
+		  "daily_token_limit":100000,"daily_request_limit":10}`)
 	if rec.Code != 200 {
 		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -112,6 +115,18 @@ func TestKeysCRUD(t *testing.T) {
 	}
 	if got := list.Keys[0].AllowedModels; len(got) != 2 || got[0] != "glm-5.2" || got[1] != "global:hy3" {
 		t.Fatalf("allowed_models 归一化 = %v want [glm-5.2 global:hy3]", got)
+	}
+	if list.Keys[0].DailyTokenLimit != 100000 || list.Keys[0].DailyRequestLimit != 10 {
+		t.Fatalf("每日配额未落库: %+v", list.Keys[0])
+	}
+
+	// 今日用量来自 keyquota（列表实时读取）。
+	p.cfg.KeyQuota.Admit(created.ID, 0, 0)
+	p.cfg.KeyQuota.AddTokens(created.ID, 500)
+	rec = doPanel(p, "GET", "/panel/api/keys", "sk-legacy", "")
+	json.Unmarshal(rec.Body.Bytes(), &list)
+	if list.Keys[0].TodayTokens != 500 || list.Keys[0].TodayRequests != 1 {
+		t.Fatalf("今日用量 = (%d,%d) want (500,1)", list.Keys[0].TodayTokens, list.Keys[0].TodayRequests)
 	}
 
 	// 编辑：改名 + 提升为管理员。

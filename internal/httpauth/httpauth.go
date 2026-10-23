@@ -32,6 +32,10 @@ type Key struct {
 	// AllowedModels 可用模型白名单（见 models.go）：空 = 不限制；
 	// 裸名对所有域生效，带 cn:/global: 前缀只限定该域。
 	AllowedModels []string
+	// DailyTokenLimit / DailyRequestLimit 密钥级每日配额（CST 自然日）；
+	// 0 = 不限制。由 server 的 keyquota 统计器执行。
+	DailyTokenLimit   int64
+	DailyRequestLimit int64
 }
 
 // Authenticate 在密钥表中查找请求携带的 Bearer 密钥，返回命中的身份。
