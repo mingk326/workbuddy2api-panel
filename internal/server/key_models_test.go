@@ -12,6 +12,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -26,7 +27,8 @@ func TestKeyAllowedModelsChat(t *testing.T) {
 		{ID: "cn-only", Secret: "sk-cn", AllowedModels: []string{"cn:glm-5.2"}},
 	}})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
-	h := NewHandler(Config{Pool: p, Upstream: up, Live: live})
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{Pool: p, Upstream: up, Live: live, RequestLog: reqLog})
 
 	do := func(key, model string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
@@ -57,6 +59,23 @@ func TestKeyAllowedModelsChat(t *testing.T) {
 	}
 	if len(bodies) != 0 {
 		t.Errorf("名单外模型不应打上游: %v", bodies)
+	}
+
+	// 2b) 可观测性：被拒请求的归档事件必须带上请求模型与 403 状态，
+	// 否则日志里只有一条无上下文的 403（issue：NAS 排障时 model=null）。
+	var rejected *reqlog.Event
+	s := reqLog.Snapshot()
+	for i := range s.Recent {
+		if s.Recent[i].Status == http.StatusForbidden {
+			rejected = &s.Recent[i]
+			break
+		}
+	}
+	if rejected == nil {
+		t.Fatal("403 请求未进入请求记录")
+	}
+	if rejected.Model != "kimi-k3" || rejected.Outcome != reqlog.OutcomeHTTPError || (rejected.Account != "" && rejected.Account != "-") {
+		t.Errorf("403 事件上下文不完整: %+v", *rejected)
 	}
 
 	// 3) 裸名条目跨域生效：global:glm-5.2 不应被 403（无 global 号时可能是 503）。

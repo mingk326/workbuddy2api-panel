@@ -687,10 +687,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
 
+	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。必须在密钥白名单
+	// 拒绝之前创建——否则 403 的流水行/请求记录里 model 为空，排障时分不清
+	// 「哪个模型被拒」，只能看到一条无上下文的 403。
+	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
+	st.effortClient = effortTrace.Client
+	if tr := requestTraceFrom(r); tr != nil {
+		tr.stat = st
+		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
+		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
+		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+	}
+	defer st.done()
+
 	// 密钥级模型白名单：名单外模型直接 403，不选号、不打上游、不扣额度。
 	// 未鉴权部署（密钥表为空）没有密钥身份 → 视为不限制；密钥名单为空同样不限制。
 	authKey, hasAuthKey := authKeyFrom(r.Context())
 	if bareModel != "" && !authKey.AllowsModel(realm, bareModel) {
+		// 先落状态再拒绝：st.done() 的流水行与 requestTrace.event 的归档事件
+		// 都从 st 取状态，这样 403 会带着请求模型出现在两处。
+		st.status = http.StatusForbidden
 		modelNotAllowed(w, peek.Model, authKey.AllowedModels)
 		return
 	}
@@ -745,17 +761,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
 	}
-
-	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
-	st.effortClient = effortTrace.Client
-	if tr := requestTraceFrom(r); tr != nil {
-		tr.stat = st
-		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
-		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
-		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
-	}
-	defer st.done()
 
 	tried := map[string]bool{}
 	var lastErr error

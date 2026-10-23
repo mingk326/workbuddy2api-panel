@@ -70,32 +70,9 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		model = defaultImageModel
 	}
 	realm, bare := resolveModel(model)
-	// 密钥级模型白名单：名单外出图模型直接 403（先于下架/路由检查，
-	// 避免向无权限的密钥泄露模型可用性）。
-	if key, ok := authKeyFrom(r.Context()); ok && !key.AllowsModel(realm, bare) {
-		modelNotAllowed(w, model, key.AllowedModels)
-		return
-	}
-	// 已下架模型 → 直接 400 并指出替代（实测 14401 route config not found 会白烧每个账号）。
-	if upstream.ImageModelRetired(bare) {
-		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
-			fmt.Sprintf("%s 已被上游下架（14401 route config not found），请改用 hy-image-3.5 等现行模型", bare))
-		return
-	}
-	// 该模型在本域没有出图路由 → 直接 400，别打满全池（实测 14401 会白烧每个账号）。
-	if !upstream.ImageModelRoutable(bare, realm) {
-		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
-			fmt.Sprintf("%s 只在另一个域有出图路由，请改用该域的模型名", bare))
-		return
-	}
-	req["model"] = bare
-	out, err := json.Marshal(req)
-	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "internal_error", err.Error())
-		return
-	}
-
 	// 记账：与 chat 同一条管道（stdout 流水行 + 请求记录 + 用量）。
+	// 必须早于白名单/下架/路由检查创建：被拒的请求也要在流水行里留下模型名，
+	// 否则排障时只看到一条无上下文的 4xx。
 	st := &chatStat{start: start, model: bare, mode: imageMode(edit), toks: -1, budget: h.budget}
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
@@ -103,6 +80,35 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
 	defer st.done()
+
+	// 密钥级模型白名单：名单外出图模型直接 403（先于下架/路由检查，
+	// 避免向无权限的密钥泄露模型可用性）。
+	if key, ok := authKeyFrom(r.Context()); ok && !key.AllowsModel(realm, bare) {
+		st.status = http.StatusForbidden
+		modelNotAllowed(w, model, key.AllowedModels)
+		return
+	}
+	// 已下架模型 → 直接 400 并指出替代（实测 14401 route config not found 会白烧每个账号）。
+	if upstream.ImageModelRetired(bare) {
+		st.status = http.StatusBadRequest
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			fmt.Sprintf("%s 已被上游下架（14401 route config not found），请改用 hy-image-3.5 等现行模型", bare))
+		return
+	}
+	// 该模型在本域没有出图路由 → 直接 400，别打满全池（实测 14401 会白烧每个账号）。
+	if !upstream.ImageModelRoutable(bare, realm) {
+		st.status = http.StatusBadRequest
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			fmt.Sprintf("%s 只在另一个域有出图路由，请改用该域的模型名", bare))
+		return
+	}
+	req["model"] = bare
+	out, err := json.Marshal(req)
+	if err != nil {
+		st.status = http.StatusInternalServerError
+		writeOpenAIError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
 
 	tried := map[string]bool{}
 	var lastErr error
