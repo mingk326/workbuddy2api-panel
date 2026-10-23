@@ -46,6 +46,17 @@ async function api(path, opts = {}) {
   if (opts.body) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
   if (r.status === 401) { openKey(); const e = new Error('密钥无效或未填写'); e.status = 401; throw e; }
+  // 防爆破锁定：服务端返回 429 + Retry-After（剩余秒数），把剩余时间展示出来，
+  // 否则用户会以为"密钥明明是对的却进不去"。
+  if (r.status === 429) {
+    const secs = Number(r.headers.get('Retry-After') || 0);
+    const mins = secs > 0 ? Math.max(1, Math.ceil(secs / 60)) : 60;
+    const msg = '尝试次数过多，面板已锁定，请约 ' + mins + ' 分钟后再试';
+    openKey(msg);
+    const e = new Error(msg);
+    e.status = 429;
+    throw e;
+  }
   const d = await r.json().catch(() => ({}));
   // status 挂到错误上：调用方靠它区分「可重试的抖动」与「重试无意义的终态」
   // （登录轮询要据此决定继续等 OAuth 还是提示重新发起，见 pollLogin）。
@@ -317,7 +328,12 @@ function formatRate(rate) {
 }
 
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
-function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+// msg 非空时把锁定/错误原因显示在门内（如 429 还剩多少分钟）。
+function openKey(msg) {
+  if (msg) { $('keyErr').hidden = false; $('keyErr').textContent = msg; } else { $('keyErr').hidden = true; }
+  $('keyVeil').classList.add('on');
+  setTimeout(() => $('keyInput').focus(), 60);
+}
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
@@ -327,7 +343,10 @@ $('btnKey').onclick = async () => {
     $('keyErr').hidden = true;
     $('keyVeil').classList.remove('on');
     start();
-  } catch (e) { $('keyErr').hidden = false; }
+  } catch (e) {
+    $('keyErr').hidden = false;
+    $('keyErr').textContent = e.status === 429 ? e.message : '密钥不正确，请重试。';
+  }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 

@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -62,8 +63,11 @@ func TestPanelOnlyAdminKey(t *testing.T) {
 		{"sk-wrong", 401},
 		{"", 401},
 	}
-	for _, c := range cases {
-		if got := doPanel(p, "GET", "/panel/api/logs", c.key, "").Code; got != c.want {
+	for i, c := range cases {
+		// 每个用例换一个 IP：鉴权失败会按 IP 锁定一小时，共用 IP 会把后续
+		// 用例变成 429（锁定行为本身由 lockout_test.go 覆盖）。
+		remote := "198.51.100." + strconv.Itoa(i+1) + ":1234"
+		if got := doPanelFrom(p, "GET", "/panel/api/logs", c.key, remote).Code; got != c.want {
 			t.Errorf("key=%q code=%d want %d", c.key, got, c.want)
 		}
 	}

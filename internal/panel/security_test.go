@@ -136,11 +136,13 @@ func TestAuthLayerBehavior(t *testing.T) {
 		t.Fatalf("no key: code=%d want 401", rec.Code)
 	}
 	// 用不存在的路由验证"带正确 key 已过鉴权"（避免触碰依赖 nil 的 handler）。
+	// 换一个 IP：上一个未鉴权请求已按防爆破策略锁定 192.0.2.1 一小时。
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest("GET", "/panel/api/nonexistent", nil)
+	req2.RemoteAddr = "192.0.2.2:1234"
 	req2.Header.Set("Authorization", "Bearer test-key")
 	p.ServeHTTP(rec2, req2)
-	if rec2.Code == http.StatusUnauthorized {
-		t.Error("valid key must pass the auth layer")
+	if rec2.Code != http.StatusNotFound {
+		t.Errorf("valid key must pass the auth layer, code=%d want 404", rec2.Code)
 	}
 }

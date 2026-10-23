@@ -102,6 +102,9 @@ type Panel struct {
 	// keyMu 密钥 CRUD 的读-改-写串行化：配置页保存与密钥增删改可能并发，
 	// 不串行会把彼此刚写入的字段覆盖回旧值。
 	keyMu sync.Mutex
+
+	// authLock 面板鉴权失败锁定（按客户端 IP，输错一次锁一小时）。
+	authLock *authLockout
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -149,11 +152,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:      cfg,
+		mux:      http.NewServeMux(),
+		started:  time.Now(),
+		logs:     NewRing(500),
+		logins:   map[string]loginSession{},
+		authLock: newAuthLockout(authLockDuration),
 	}
 	p.routes()
 	return p
@@ -230,11 +234,30 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // 密钥表为空（未启用鉴权）时放行；普通密钥即便有效也回 401 而不是 403——
 // 403 会告诉持有者"这把密钥是真的、只是权限不够"，等于给暴力猜测送确认信号。
+//
+// 防爆破：鉴权失败一次即按客户端 IP 锁定 authLockDuration；锁定期内一律 429
+// （带 Retry-After），即使携带正确密钥也拒绝——否则锁定期间仍可无限试探。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		keys := p.keyTable()
+		if len(keys) == 0 {
+			next(w, r)
+			return
+		}
+		ip := clientIPForLock(r)
+		if remain, locked := p.authLock.locked(ip); locked {
+			secs := int(remain.Seconds())
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			writeErr(w, http.StatusTooManyRequests, "too_many_attempts")
+			return
+		}
 		key, ok := httpauth.Authenticate(r, keys)
-		if !ok || (len(keys) > 0 && !key.Admin) {
+		if !ok || !key.Admin {
+			p.authLock.fail(ip)
+			log.Printf("panel: 鉴权失败 ip=%s，已锁定 %s", ip, authLockDuration)
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}

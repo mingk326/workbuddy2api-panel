@@ -708,6 +708,8 @@ http://127.0.0.1:7863/panel/
 
 **鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
 
+**防爆破锁定**：面板鉴权失败**一次**即按客户端 IP 锁定 **1 小时**；锁定期内即使携带正确密钥也返回 `429`（`error: too_many_attempts`，`Retry-After` 为剩余秒数），避免锁定期间继续试探。客户端 IP 依次取 `CF-Connecting-IP` → `X-Real-IP` → `X-Forwarded-For` 首段 → TCP 对端；锁定状态仅存内存，进程重启即清空。注意这些请求头可被伪造，公网直连时换头即可绕过锁定——请始终置于反向代理/隧道之后并限制来源。
+
 > ⚠️ 公网部署提示：服务自身只提供明文 HTTP，**请务必置于 HTTPS 反向代理之后**（Nginx/Caddy 等）并配置访问限流；仅本机或私有网络使用时可直接运行。
 
 ## 🔌 API 端点
