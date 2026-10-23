@@ -1204,6 +1204,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <input id="keyDailyRequests" type="number" min="0" placeholder="0 = 不限制">
               <span class="hint">CST 自然日计数；Token = 输入+输出，次日 00:00 重置</span></label>
           </div>
+          <div class="grid2">
+            <label class="fld"><span class="lb">每分钟请求数上限（RPM）</span>
+              <input id="keyRPM" type="number" min="0" placeholder="0 = 不限制">
+              <span class="hint">滑动 60 秒窗口，含出图；超限 429 rate_limit_exceeded</span></label>
+            <label class="fld"><span class="lb">并发请求上限</span>
+              <input id="keyConcurrency" type="number" min="0" placeholder="0 = 不限制">
+              <span class="hint">在途请求数（流式到最后一帧、含出图）；超限 429 + Retry-After</span></label>
+          </div>
           <div class="inline" style="justify-content:flex-end">
             <button type="button" id="btnKeyCancel">取消</button>
             <button type="button" class="primary" id="btnKeySave">保存密钥</button>
@@ -1216,7 +1224,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="hint">优先级：客户端显式档位 &gt; 密钥「按模型」&gt; 密钥「默认」&gt; 全局 thinking.* &gt; 模型默认。
             普通密钥只能调用 <code>/v1/*</code>；<b>管理员</b>密钥才能进入本面板。旧版 <code>api_key</code> 恒为管理员，只读展示。
             <br>「可用模型」留空 = 不限制；名单外模型直接 403（<code>model_not_allowed</code>），<code>/v1/models</code> 也只返回名单内模型。
-            <br>「每日配额」按 CST 自然日计数，超限返回 429 <code>insufficient_quota</code>（<code>Retry-After</code> 到次日 00:00）；0 = 不限制。</div>
+            <br>「每日配额」按 CST 自然日计数，超限返回 429 <code>insufficient_quota</code>（<code>Retry-After</code> 到次日 00:00）；0 = 不限制。
+            <br>「RPM / 并发」为即时限流：RPM 按滑动 60 秒统计，并发按在途请求（流式到最后一帧）统计，两者都含出图；超限 429 <code>rate_limit_exceeded</code>；0 = 不限制。</div>
         </div>
       </div>
     </section>

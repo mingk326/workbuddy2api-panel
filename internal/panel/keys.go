@@ -34,6 +34,9 @@ type panelKey struct {
 	// DailyTokenLimit / DailyRequestLimit 每日配额（CST 自然日）；0 = 不限制。
 	DailyTokenLimit   int64 `json:"daily_token_limit,omitempty"`
 	DailyRequestLimit int64 `json:"daily_request_limit,omitempty"`
+	// RPMLimit / MaxConcurrency 即时限流：滑动 60 秒请求数与在途并发；0 = 不限制。
+	RPMLimit       int `json:"rpm_limit,omitempty"`
+	MaxConcurrency int `json:"max_concurrency,omitempty"`
 }
 
 // keyView 列表展示项（密钥脱敏，绝不回传完整值）。
@@ -51,6 +54,11 @@ type keyView struct {
 	DailyRequestLimit int64 `json:"daily_request_limit"`
 	TodayTokens       int64 `json:"today_tokens"`
 	TodayRequests     int64 `json:"today_requests"`
+	// 即时限流与当前用量：仅当配置了对应上限时统计（0 = 未配置）。
+	RPMLimit        int `json:"rpm_limit"`
+	MaxConcurrency  int `json:"max_concurrency"`
+	RPMUsed         int `json:"rpm_used"`
+	ConcurrencyUsed int `json:"concurrency_used"`
 }
 
 type keyUpsertReq struct {
@@ -63,6 +71,8 @@ type keyUpsertReq struct {
 	AllowedModels     []string          `json:"allowed_models"`
 	DailyTokenLimit   int64             `json:"daily_token_limit"`
 	DailyRequestLimit int64             `json:"daily_request_limit"`
+	RPMLimit          int               `json:"rpm_limit"`
+	MaxConcurrency    int               `json:"max_concurrency"`
 }
 
 type keyUpdateReq struct {
@@ -74,6 +84,8 @@ type keyUpdateReq struct {
 	AllowedModels     []string          `json:"allowed_models"`      // nil = 不改；[] = 清空（= 不限制）
 	DailyTokenLimit   *int64            `json:"daily_token_limit"`   // nil = 不改；0 = 不限制
 	DailyRequestLimit *int64            `json:"daily_request_limit"` // nil = 不改；0 = 不限制
+	RPMLimit          *int              `json:"rpm_limit"`           // nil = 不改；0 = 不限制
+	MaxConcurrency    *int              `json:"max_concurrency"`     // nil = 不改；0 = 不限制
 }
 
 type keyDeleteReq struct {
@@ -98,10 +110,13 @@ func (p *Panel) keysList(w http.ResponseWriter, r *http.Request) {
 	views := make([]keyView, 0, len(keys)+1)
 	for _, k := range keys {
 		tok, req := p.keyUsage(k.ID)
+		rpmUsed, inflight := p.keyLive(k.ID)
 		views = append(views, keyView{
 			ID: k.ID, Name: k.Name, Masked: maskKey(k.Key), Admin: k.Admin,
 			DefaultEffort: k.DefaultEffort, PerModel: k.PerModel, AllowedModels: k.AllowedModels,
 			DailyTokenLimit: k.DailyTokenLimit, DailyRequestLimit: k.DailyRequestLimit,
+			RPMLimit: k.RPMLimit, MaxConcurrency: k.MaxConcurrency,
+			RPMUsed: rpmUsed, ConcurrencyUsed: inflight,
 			TodayTokens: tok, TodayRequests: req,
 		})
 	}
@@ -146,6 +161,10 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "每日配额不能为负（0 = 不限制）")
 		return
 	}
+	if req.RPMLimit < 0 || req.MaxConcurrency < 0 {
+		writeErr(w, http.StatusBadRequest, "RPM / 并发上限不能为负（0 = 不限制）")
+		return
+	}
 
 	p.keyMu.Lock()
 	defer p.keyMu.Unlock()
@@ -186,6 +205,8 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		AllowedModels:     normalizeModelList(req.AllowedModels),
 		DailyTokenLimit:   req.DailyTokenLimit,
 		DailyRequestLimit: req.DailyRequestLimit,
+		RPMLimit:          req.RPMLimit,
+		MaxConcurrency:    req.MaxConcurrency,
 	}
 	keys = append(keys, entry)
 	if err := p.saveKeys(m, keys); err != nil {
@@ -198,7 +219,8 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		"key": secret, // 唯一一次回显完整密钥
 		"entry": keyView{ID: id, Name: entry.Name, Masked: maskKey(secret), Admin: entry.Admin,
 			DefaultEffort: entry.DefaultEffort, PerModel: entry.PerModel, AllowedModels: entry.AllowedModels,
-			DailyTokenLimit: entry.DailyTokenLimit, DailyRequestLimit: entry.DailyRequestLimit},
+			DailyTokenLimit: entry.DailyTokenLimit, DailyRequestLimit: entry.DailyRequestLimit,
+			RPMLimit: entry.RPMLimit, MaxConcurrency: entry.MaxConcurrency},
 	})
 }
 
@@ -268,6 +290,20 @@ func (p *Panel) keysUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		keys[idx].DailyRequestLimit = *req.DailyRequestLimit
+	}
+	if req.RPMLimit != nil {
+		if *req.RPMLimit < 0 {
+			writeErr(w, http.StatusBadRequest, "每分钟请求数上限不能为负（0 = 不限制）")
+			return
+		}
+		keys[idx].RPMLimit = *req.RPMLimit
+	}
+	if req.MaxConcurrency != nil {
+		if *req.MaxConcurrency < 0 {
+			writeErr(w, http.StatusBadRequest, "并发上限不能为负（0 = 不限制）")
+			return
+		}
+		keys[idx].MaxConcurrency = *req.MaxConcurrency
 	}
 	if !hasAdmin(stringField(m, "api_key"), keys) {
 		writeErr(w, http.StatusBadRequest, "至少保留一把管理员密钥（admin=true），否则面板将无法登录")
@@ -419,6 +455,14 @@ func (p *Panel) keyUsage(id string) (tokens, requests int64) {
 		return 0, 0
 	}
 	return p.cfg.KeyQuota.Snapshot(id)
+}
+
+// keyLive 返回该密钥当前滑动一分钟请求数与在途并发；未接线时为 0。
+func (p *Panel) keyLive(id string) (rpm, inflight int) {
+	if p.cfg.KeyQuota == nil || id == "" {
+		return 0, 0
+	}
+	return p.cfg.KeyQuota.Live(id)
 }
 
 // normalizeModelList 归一化可用模型白名单：去空白、去重、保序；空 = nil（不限制）。

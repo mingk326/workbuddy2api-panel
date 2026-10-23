@@ -72,9 +72,11 @@ type chatStat struct {
 	userAgent string
 
 	// 密钥级每日配额：keyID 为空（未鉴权）或 keyQuota 为 nil 时不累计。
-	// 只在 chat 路径赋值；出图按产品决定不计入配额。
+	// 只在 chat 路径赋值；出图按产品决定不计入每日配额（RPM/并发仍计入）。
 	keyID    string
 	keyQuota *keyquota.Tracker
+	// keyLease 在途并发租约（未配置并发上限时为 nil），done 时归还。
+	keyLease *keyquota.Lease
 
 	// 思考档位溯源（issue #43）：client 为客户端原始档位（任何注入之前），
 	// in 为出站管线降级前、out 为最终出站。渲染规则见 effortLabel。
@@ -103,6 +105,10 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
+	// 并发租约必须最先归还：日志/统计再慢也不该继续占着名额。
+	if s.keyLease != nil {
+		s.keyLease.Release()
+	}
 	total := time.Since(s.start)
 	logChatRowFull(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks,
 		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent,

@@ -94,7 +94,8 @@ func TestKeysCRUD(t *testing.T) {
 	rec = doPanel(p, "POST", "/panel/api/keys", "sk-legacy",
 		`{"name":"codex","thinking_default_effort":"max","thinking_per_model":{"glm-5.2":"low"},
 		  "allowed_models":[" glm-5.2 ","glm-5.2","","global:hy3"],
-		  "daily_token_limit":100000,"daily_request_limit":10}`)
+		  "daily_token_limit":100000,"daily_request_limit":10,
+		  "rpm_limit":60,"max_concurrency":4}`)
 	if rec.Code != 200 {
 		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -123,14 +124,27 @@ func TestKeysCRUD(t *testing.T) {
 	if list.Keys[0].DailyTokenLimit != 100000 || list.Keys[0].DailyRequestLimit != 10 {
 		t.Fatalf("每日配额未落库: %+v", list.Keys[0])
 	}
+	if list.Keys[0].RPMLimit != 60 || list.Keys[0].MaxConcurrency != 4 {
+		t.Fatalf("RPM / 并发上限未落库: %+v", list.Keys[0])
+	}
 
 	// 今日用量来自 keyquota（列表实时读取）。
-	p.cfg.KeyQuota.Admit(created.ID, 0, 0)
+	_, lease := p.cfg.KeyQuota.Admit(created.ID, keyquota.Limits{RPM: 60, MaxConcurrency: 4})
 	p.cfg.KeyQuota.AddTokens(created.ID, 500)
 	rec = doPanel(p, "GET", "/panel/api/keys", "sk-legacy", "")
 	json.Unmarshal(rec.Body.Bytes(), &list)
 	if list.Keys[0].TodayTokens != 500 || list.Keys[0].TodayRequests != 1 {
 		t.Fatalf("今日用量 = (%d,%d) want (500,1)", list.Keys[0].TodayTokens, list.Keys[0].TodayRequests)
+	}
+	if list.Keys[0].RPMUsed != 1 || list.Keys[0].ConcurrencyUsed != 1 {
+		t.Fatalf("实时限流 = (%d,%d) want (1,1)", list.Keys[0].RPMUsed, list.Keys[0].ConcurrencyUsed)
+	}
+	lease.Release()
+
+	// 负数拒绝。
+	if rec := doPanel(p, "POST", "/panel/api/keys/update", "sk-legacy",
+		`{"id":"`+created.ID+`","rpm_limit":-1}`); rec.Code != 400 {
+		t.Fatalf("negative rpm code=%d want 400", rec.Code)
 	}
 
 	// 编辑：改名 + 提升为管理员。

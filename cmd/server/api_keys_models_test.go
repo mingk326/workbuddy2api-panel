@@ -32,10 +32,10 @@ func TestAPIKeysAllowedModelsNormalized(t *testing.T) {
 	}
 }
 
-// TestAPIKeysDailyQuota 每日配额透传到运行期密钥表；负值 fail fast。
+// TestAPIKeysDailyQuota 每日配额与 RPM/并发透传到运行期密钥表；负值 fail fast。
 func TestAPIKeysDailyQuota(t *testing.T) {
 	c, err := ParseConfig([]byte(`{"api_keys":[{"key":"sk-a","admin":true,
-		"daily_token_limit":1000,"daily_request_limit":10}]}`))
+		"daily_token_limit":1000,"daily_request_limit":10,"rpm_limit":60,"max_concurrency":4}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,9 +43,14 @@ func TestAPIKeysDailyQuota(t *testing.T) {
 	if len(keys) != 1 || keys[0].DailyTokenLimit != 1000 || keys[0].DailyRequestLimit != 10 {
 		t.Fatalf("effective keys = %+v", keys)
 	}
+	if keys[0].RPMLimit != 60 || keys[0].MaxConcurrency != 4 {
+		t.Fatalf("rpm/concurrency not propagated: %+v", keys[0])
+	}
 	for _, body := range []string{
 		`{"api_keys":[{"key":"sk-a","admin":true,"daily_token_limit":-1}]}`,
 		`{"api_keys":[{"key":"sk-a","admin":true,"daily_request_limit":-1}]}`,
+		`{"api_keys":[{"key":"sk-a","admin":true,"rpm_limit":-1}]}`,
+		`{"api_keys":[{"key":"sk-a","admin":true,"max_concurrency":-1}]}`,
 	} {
 		if _, err := ParseConfig([]byte(body)); err == nil {
 			t.Errorf("negative quota should fail fast: %s", body)

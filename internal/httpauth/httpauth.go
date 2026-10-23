@@ -36,6 +36,11 @@ type Key struct {
 	// 0 = 不限制。由 server 的 keyquota 统计器执行。
 	DailyTokenLimit   int64
 	DailyRequestLimit int64
+	// RPMLimit 每分钟请求数上限（滑动 60 秒窗口，含出图）；0 = 不限制。
+	RPMLimit int
+	// MaxConcurrency 同时在途请求上限（流式到最后一帧才算结束，含出图）；
+	// 0 = 不限制。
+	MaxConcurrency int
 }
 
 // Authenticate 在密钥表中查找请求携带的 Bearer 密钥，返回命中的身份。

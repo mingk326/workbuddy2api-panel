@@ -40,6 +40,11 @@ type APIKeyEntry struct {
 	DailyTokenLimit int64 `json:"daily_token_limit,omitempty"`
 	// DailyRequestLimit 每日模型请求数上限（CST 自然日）；0 = 不限制。
 	DailyRequestLimit int64 `json:"daily_request_limit,omitempty"`
+	// RPMLimit 每分钟请求数上限（滑动 60 秒窗口，含出图）；0 = 不限制。
+	RPMLimit int `json:"rpm_limit,omitempty"`
+	// MaxConcurrency 同时在途请求上限（流式到最后一帧才算结束，含出图）；
+	// 0 = 不限制。
+	MaxConcurrency int `json:"max_concurrency,omitempty"`
 }
 
 // Config 顶层配置。
@@ -887,6 +892,12 @@ func (c *Config) normalizeAPIKeys() error {
 		if k.DailyRequestLimit < 0 {
 			return fmt.Errorf("api_keys[id=%s].daily_request_limit: 不能为负（0 = 不限制）", k.ID)
 		}
+		if k.RPMLimit < 0 {
+			return fmt.Errorf("api_keys[id=%s].rpm_limit: 不能为负（0 = 不限制）", k.ID)
+		}
+		if k.MaxConcurrency < 0 {
+			return fmt.Errorf("api_keys[id=%s].max_concurrency: 不能为负（0 = 不限制）", k.ID)
+		}
 		anyAdmin = anyAdmin || k.Admin
 		out = append(out, k)
 	}
@@ -912,6 +923,8 @@ func (c *Config) EffectiveKeys() []httpauth.Key {
 			AllowedModels:     k.AllowedModels,
 			DailyTokenLimit:   k.DailyTokenLimit,
 			DailyRequestLimit: k.DailyRequestLimit,
+			RPMLimit:          k.RPMLimit,
+			MaxConcurrency:    k.MaxConcurrency,
 		})
 	}
 	if c.APIKey != "" {

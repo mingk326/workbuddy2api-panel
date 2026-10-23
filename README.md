@@ -356,10 +356,12 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
 | `api_key` | 空 | 旧版单一密钥；非空时**恒为管理员**（可进面板），与 `api_keys` 并存。空 = 不鉴权直接放行（公网必须设置） |
-| `api_keys` | `[]` | 多密钥表（1.14.0+）：`{id, key, name, admin, thinking_default_effort, thinking_per_model, allowed_models, daily_token_limit, daily_request_limit}`。`admin=true` 才能进面板；每把密钥可单独配置默认思考档、按模型覆盖、**可用模型白名单**与**每日配额**。至少保留一把管理员密钥，密钥/ID 不可重复 |
+| `api_keys` | `[]` | 多密钥表（1.14.0+）：`{id, key, name, admin, thinking_default_effort, thinking_per_model, allowed_models, daily_token_limit, daily_request_limit, rpm_limit, max_concurrency}`。`admin=true` 才能进面板；每把密钥可单独配置默认思考档、按模型覆盖、**可用模型白名单**、**每日配额**与**即时限流**。至少保留一把管理员密钥，密钥/ID 不可重复 |
 | `api_keys[].allowed_models` | `[]` | **可用模型白名单**：空 = 不限制；裸名（`glm-5.3`）对 cn/global 两个域都生效，带域前缀（`global:hy-image-3.5`）只限定该域。名单外模型直接 403 `model_not_allowed`（不选号、不打上游），`/v1/models` 只返回名单内模型；`pool.model_fallback` 的降级目标也必须在名单内。`config.api_key` 恒不限制 |
 | `api_keys[].daily_token_limit` | `0` | **每日 Token 上限**（CST 自然日，输入+输出）：超限返回 429 `insufficient_quota` + `Retry-After`（到次日 00:00），不选号、不打上游；`0` = 不限制。只累计上游观测到的 usage（缺失的请求不计 token，请求数照常计）。计数落盘 `key-usage.json`，重启不丢；正在进行的请求可能让用量略超上限一次 |
 | `api_keys[].daily_request_limit` | `0` | **每日模型请求数上限**（CST 自然日）：通过配额检查时 +1，被上游拒绝的请求也计入；`0` = 不限制。旧版 `config.api_key` 不参与配额 |
+| `api_keys[].rpm_limit` | `0` | **每分钟请求数上限**（滑动 60 秒窗口，含 chat / messages / responses 与出图）：超限返回 429 `rate_limit_exceeded` + `Retry-After`（窗口腾出的秒数），不选号、不打上游；`0` = 不限制。只统计通过准入的客户端请求，被拒请求不消耗日请求数；窗口在内存中维护，重启清零 |
+| `api_keys[].max_concurrency` | `0` | **同时在途请求上限**（流式请求到最后一帧才算结束，含出图）：超限返回 429 `rate_limit_exceeded` + `Retry-After: 1`；`0` = 不限制。建议所有密钥的并发上限之和不超过账号数，避免互相抢号 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
@@ -683,7 +685,7 @@ http://127.0.0.1:7863/panel/
 
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
 
-**配置热生效**：保存配置后，`api_key`、`api_keys`（含可用模型白名单与每日配额）、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
+**配置热生效**：保存配置后，`api_key`、`api_keys`（含可用模型白名单、每日配额与 RPM / 并发限流）、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `features.sanitize_brand_scope`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
@@ -699,7 +701,7 @@ http://127.0.0.1:7863/panel/
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `travel`（单号旅行：无猫领养 / 有猫派出或领奖，供外部调度做每号独立随机时点）· `revive` · `disable` · `remove` · `compensation`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` · `compensation_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` · `POST accounts/add_apikey`（静态 Key `ck_`/`pt_`） |
-| 密钥管理 | `GET keys`（脱敏清单 + 今日用量）· `POST keys`（新建，完整密钥仅本次回显）· `POST keys/update`（含 `allowed_models`：`[]` = 清空为不限制；`daily_token_limit` / `daily_request_limit`：`0` = 不限制）· `POST keys/delete`（禁止删到一把不剩 / 删掉最后一把 admin） |
+| 密钥管理 | `GET keys`（脱敏清单 + 今日用量 + 实时 RPM/并发）· `POST keys`（新建，完整密钥仅本次回显）· `POST keys/update`（含 `allowed_models`：`[]` = 清空为不限制；`daily_token_limit` / `daily_request_limit` / `rpm_limit` / `max_concurrency`：`0` = 不限制）· `POST keys/delete`（禁止删到一把不剩 / 删掉最后一把 admin） |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。

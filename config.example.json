@@ -17,7 +17,9 @@
         "global:hy-image-3.5"
       ],
       "daily_token_limit": 2000000,
-      "daily_request_limit": 1000
+      "daily_request_limit": 1000,
+      "rpm_limit": 60,
+      "max_concurrency": 4
     }
   ],
   "auth_dir": "./auths",

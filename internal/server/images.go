@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyquota"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -108,6 +109,21 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		st.status = http.StatusInternalServerError
 		writeOpenAIError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
+	}
+
+	// 密钥级 RPM / 并发也覆盖出图（出图最占资源）；每日 Token/请求数仍不计入，
+	// 与既有「出图不管每日配额」口径一致。
+	if key, ok := authKeyFrom(r.Context()); ok && h.cfg.KeyQuota != nil && key.ID != "" {
+		d, lease := h.cfg.KeyQuota.Admit(key.ID, keyquota.Limits{
+			RPM:            key.RPMLimit,
+			MaxConcurrency: key.MaxConcurrency,
+		})
+		if !d.OK {
+			st.status = http.StatusTooManyRequests
+			writeKeyQuotaExceeded(w, d)
+			return
+		}
+		st.keyLease = lease // defer st.done() 在图片写完/失败返回时归还
 	}
 
 	tried := map[string]bool{}

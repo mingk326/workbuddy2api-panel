@@ -744,14 +744,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 密钥级每日配额（CST 自然日）：Token 与请求数两个维度，0 = 该维度不限制。
-	// 通过时请求数 +1；Token 在请求结束、拿到 usage 后由 st.done() 累计。
+	// 密钥级配额/限流（CST 自然日 + 滑动 60 秒 RPM + 在途并发）：
+	// 通过时请求数 +1，并拿到一个并发租约（未配置并发上限时为 nil）；
+	// Token 在请求结束、拿到 usage 后由 st.done() 累计。
 	if hasAuthKey && h.cfg.KeyQuota != nil && authKey.ID != "" {
-		if d := h.cfg.KeyQuota.Admit(authKey.ID, authKey.DailyTokenLimit, authKey.DailyRequestLimit); !d.OK {
+		d, lease := h.cfg.KeyQuota.Admit(authKey.ID, keyquota.Limits{
+			DailyTokens:    authKey.DailyTokenLimit,
+			DailyRequests:  authKey.DailyRequestLimit,
+			RPM:            authKey.RPMLimit,
+			MaxConcurrency: authKey.MaxConcurrency,
+		})
+		if !d.OK {
 			st.status = http.StatusTooManyRequests
 			writeKeyQuotaExceeded(w, d)
 			return
 		}
+		st.keyLease = lease // 与 st.done() 绑定：流式到最后一帧才释放并发
 	}
 
 	// 模型降级（pool.model_fallback）：curModel 是**本轮实际使用**的模型，初值 =

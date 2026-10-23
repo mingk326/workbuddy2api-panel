@@ -1221,14 +1221,21 @@ function splitModels(v) {
   return String(v || '').split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
 }
 
-// 今日用量 / 配额列：limit=0 显示「不限」；用量来自服务端 keyquota。
+// 今日用量 / 配额列：limit=0 显示「不限」/「—」；用量来自服务端 keyquota。
 function quotaCell(k) {
   const tl = Number(k.daily_token_limit || 0), rl = Number(k.daily_request_limit || 0);
   const tu = Number(k.today_tokens || 0), ru = Number(k.today_requests || 0);
+  const ul = Number(k.rpm_limit || 0), cl = Number(k.max_concurrency || 0);
+  const uu = Number(k.rpm_used || 0), cu = Number(k.concurrency_used || 0);
   const t = fmtTok(tu) + ' / ' + (tl > 0 ? fmtTok(tl) : '不限');
   const r = ru + ' / ' + (rl > 0 ? rl : '不限');
-  const title = 'Token ' + tu + ' / ' + (tl > 0 ? tl : '不限') + ' · 请求 ' + ru + ' / ' + (rl > 0 ? rl : '不限');
-  return '<span title="' + esc(title) + '">tok ' + t + '<br>req ' + r + '</span>';
+  const rate = 'rpm ' + (ul > 0 ? uu + ' / ' + ul : '—') +
+    ' · 并发 ' + (cl > 0 ? cu + ' / ' + cl : '—');
+  const title = 'Token ' + tu + ' / ' + (tl > 0 ? tl : '不限') +
+    ' · 请求 ' + ru + ' / ' + (rl > 0 ? rl : '不限') +
+    ' · RPM ' + (ul > 0 ? uu + ' / ' + ul : '不限') +
+    ' · 并发 ' + (cl > 0 ? cu + ' / ' + cl : '不限');
+  return '<span title="' + esc(title) + '">tok ' + t + '<br>req ' + r + '<br>' + rate + '</span>';
 }
 
 // 勾选框回填：输入框里的裸名等价于「两个域都允许」，对应域条目也显示为已选。
@@ -1296,6 +1303,8 @@ function openKeyForm(k) {
   $('keyModels').value = k && Array.isArray(k.allowed_models) ? k.allowed_models.join(', ') : '';
   $('keyDailyTokens').value = k && k.daily_token_limit ? String(k.daily_token_limit) : '';
   $('keyDailyRequests').value = k && k.daily_request_limit ? String(k.daily_request_limit) : '';
+  $('keyRPM').value = k && k.rpm_limit ? String(k.rpm_limit) : '';
+  $('keyConcurrency').value = k && k.max_concurrency ? String(k.max_concurrency) : '';
   $('keyModelsPick').hidden = true;
   $('keyModelsFilter').value = '';
   $('keyAdmin').checked = k ? !!k.admin : false;
@@ -1331,6 +1340,8 @@ $('btnKeySave').onclick = async () => {
     // 0 / 空 = 不限制；空串 Number('')=0，正好符合语义。
     daily_token_limit: Number($('keyDailyTokens').value) || 0,
     daily_request_limit: Number($('keyDailyRequests').value) || 0,
+    rpm_limit: Number($('keyRPM').value) || 0,
+    max_concurrency: Number($('keyConcurrency').value) || 0,
   };
   const btn = $('btnKeySave');
   btn.disabled = true; btn.textContent = '保存中…';
