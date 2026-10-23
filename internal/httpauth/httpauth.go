@@ -29,6 +29,9 @@ type Key struct {
 	Admin         bool
 	DefaultEffort string
 	PerModel      map[string]string
+	// AllowedModels 可用模型白名单（见 models.go）：空 = 不限制；
+	// 裸名对所有域生效，带 cn:/global: 前缀只限定该域。
+	AllowedModels []string
 }
 
 // Authenticate 在密钥表中查找请求携带的 Bearer 密钥，返回命中的身份。

@@ -45,14 +45,20 @@ func (h *Handler) chatBusy(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(req.Models))
 	known := h.servableModelSet()
+	// 密钥级模型白名单：名单外模型按 unknown 返回（不暴露池状态，也不让
+	// 客户端把它当成可选模型）。未鉴权/名单为空 = 不限制。
+	key, hasKey := authKeyFrom(r.Context())
 	for _, m := range req.Models {
 		realm, bare := resolveModel(m)
 		lvl := busyLevelUnknown
-		if _, ok := known[bare]; ok {
-			if h.cfg.Pool != nil && h.cfg.Pool.ModelBlockedForRealm(bare, realm).Blocked {
-				lvl = busyLevelBusy
-			} else {
-				lvl = busyLevelIdle
+		allowed := !hasKey || key.AllowsModel(realm, bare)
+		if allowed {
+			if _, ok := known[bare]; ok {
+				if h.cfg.Pool != nil && h.cfg.Pool.ModelBlockedForRealm(bare, realm).Blocked {
+					lvl = busyLevelBusy
+				} else {
+					lvl = busyLevelIdle
+				}
 			}
 		}
 		out = append(out, map[string]any{"model": m, "busy_level": lvl})

@@ -28,6 +28,9 @@ type panelKey struct {
 	Admin         bool              `json:"admin,omitempty"`
 	DefaultEffort string            `json:"thinking_default_effort,omitempty"`
 	PerModel      map[string]string `json:"thinking_per_model,omitempty"`
+	// AllowedModels 可用模型白名单：空 = 不限制；裸名对所有域生效，
+	// 带 cn:/global: 前缀只限定该域（与 httpauth.Key.AllowsModel 同口径）。
+	AllowedModels []string `json:"allowed_models,omitempty"`
 }
 
 // keyView 列表展示项（密钥脱敏，绝不回传完整值）。
@@ -39,6 +42,7 @@ type keyView struct {
 	Legacy        bool              `json:"legacy,omitempty"`
 	DefaultEffort string            `json:"thinking_default_effort"`
 	PerModel      map[string]string `json:"thinking_per_model,omitempty"`
+	AllowedModels []string          `json:"allowed_models"`
 }
 
 type keyUpsertReq struct {
@@ -48,6 +52,7 @@ type keyUpsertReq struct {
 	Admin         bool              `json:"admin"`
 	DefaultEffort string            `json:"thinking_default_effort"`
 	PerModel      map[string]string `json:"thinking_per_model"`
+	AllowedModels []string          `json:"allowed_models"`
 }
 
 type keyUpdateReq struct {
@@ -56,6 +61,7 @@ type keyUpdateReq struct {
 	Admin         *bool             `json:"admin"`
 	DefaultEffort *string           `json:"thinking_default_effort"`
 	PerModel      map[string]string `json:"thinking_per_model"` // nil = 不改；{} = 清空
+	AllowedModels []string          `json:"allowed_models"`     // nil = 不改；[] = 清空（= 不限制）
 }
 
 type keyDeleteReq struct {
@@ -81,7 +87,7 @@ func (p *Panel) keysList(w http.ResponseWriter, r *http.Request) {
 	for _, k := range keys {
 		views = append(views, keyView{
 			ID: k.ID, Name: k.Name, Masked: maskKey(k.Key), Admin: k.Admin,
-			DefaultEffort: k.DefaultEffort, PerModel: k.PerModel,
+			DefaultEffort: k.DefaultEffort, PerModel: k.PerModel, AllowedModels: k.AllowedModels,
 		})
 	}
 	if legacy != "" {
@@ -157,6 +163,7 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		ID: id, Key: secret, Name: strings.TrimSpace(req.Name), Admin: req.Admin,
 		DefaultEffort: strings.ToLower(strings.TrimSpace(req.DefaultEffort)),
 		PerModel:      normalizeEffortMap(req.PerModel),
+		AllowedModels: normalizeModelList(req.AllowedModels),
 	}
 	keys = append(keys, entry)
 	if err := p.saveKeys(m, keys); err != nil {
@@ -167,7 +174,7 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		"ok":    true,
 		"id":    id,
 		"key":   secret, // 唯一一次回显完整密钥
-		"entry": keyView{ID: id, Name: entry.Name, Masked: maskKey(secret), Admin: entry.Admin, DefaultEffort: entry.DefaultEffort, PerModel: entry.PerModel},
+		"entry": keyView{ID: id, Name: entry.Name, Masked: maskKey(secret), Admin: entry.Admin, DefaultEffort: entry.DefaultEffort, PerModel: entry.PerModel, AllowedModels: entry.AllowedModels},
 	})
 }
 
@@ -218,6 +225,10 @@ func (p *Panel) keysUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.PerModel != nil {
 		keys[idx].PerModel = normalizeEffortMap(req.PerModel)
+	}
+	// nil = 不改；[]（显式空数组）= 清空白名单 = 不限制。
+	if req.AllowedModels != nil {
+		keys[idx].AllowedModels = normalizeModelList(req.AllowedModels)
 	}
 	if !hasAdmin(stringField(m, "api_key"), keys) {
 		writeErr(w, http.StatusBadRequest, "至少保留一把管理员密钥（admin=true），否则面板将无法登录")
@@ -359,6 +370,28 @@ func normalizeEffortMap(in map[string]string) map[string]string {
 			continue
 		}
 		out[model] = effort
+	}
+	return out
+}
+
+// normalizeModelList 归一化可用模型白名单：去空白、去重、保序；空 = nil（不限制）。
+// 条目形态（裸名 / cn: / global:）与 httpauth.Key.AllowsModel 同口径。
+func normalizeModelList(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, m := range in {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

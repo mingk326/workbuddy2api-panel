@@ -33,6 +33,9 @@ type APIKeyEntry struct {
 	Admin         bool              `json:"admin,omitempty"`                   // 是否可进管理面板
 	DefaultEffort string            `json:"thinking_default_effort,omitempty"` // 该密钥默认思考档
 	PerModel      map[string]string `json:"thinking_per_model,omitempty"`      // 该密钥按模型覆盖档位
+	// AllowedModels 可用模型白名单：空 = 不限制；裸名（"glm-5.3"）对 cn/global
+	// 两个域都生效，带域前缀（"global:hy-image-3.5"）只限定该域。
+	AllowedModels []string `json:"allowed_models,omitempty"`
 }
 
 // Config 顶层配置。
@@ -800,6 +803,29 @@ func normalizePerModel(field string, in map[string]string) (map[string]string, e
 	return merged, nil
 }
 
+// normalizeAllowedModels 归一化可用模型白名单：去空白、去重、保持原顺序。
+// 空/nil = 不限制；条目不校验模型是否存在（上游目录会变，配错只会 403，
+// 不会阻止启动），但带域前缀的写法与 server.resolveModel 完全同口径。
+func normalizeAllowedModels(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, m := range in {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // normalizeAPIKeys 校验并归一化多密钥表。
 //
 // 规则：
@@ -848,6 +874,7 @@ func (c *Config) normalizeAPIKeys() error {
 		if k.PerModel, err = normalizePerModel("api_keys[id="+k.ID+"].thinking_per_model", k.PerModel); err != nil {
 			return err
 		}
+		k.AllowedModels = normalizeAllowedModels(k.AllowedModels)
 		anyAdmin = anyAdmin || k.Admin
 		out = append(out, k)
 	}
@@ -870,6 +897,7 @@ func (c *Config) EffectiveKeys() []httpauth.Key {
 			Admin:         k.Admin,
 			DefaultEffort: k.DefaultEffort,
 			PerModel:      k.PerModel,
+			AllowedModels: k.AllowedModels,
 		})
 	}
 	if c.APIKey != "" {

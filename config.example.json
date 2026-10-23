@@ -10,7 +10,12 @@
       "thinking_default_effort": "high",
       "thinking_per_model": {
         "deepseek-v4.1-flash": "max"
-      }
+      },
+      "allowed_models": [
+        "glm-5.3",
+        "deepseek-v4.1-flash",
+        "global:hy-image-3.5"
+      ]
     }
   ],
   "auth_dir": "./auths",

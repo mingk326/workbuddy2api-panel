@@ -395,9 +395,22 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	data := h.modelList()
+	// 密钥级模型白名单：只列出该密钥可用的模型，客户端选择器不再出现会 403 的项。
+	if key, ok := authKeyFrom(r.Context()); ok && len(key.AllowedModels) > 0 {
+		filtered := make([]map[string]any, 0, len(data))
+		for _, it := range data {
+			id, _ := it["id"].(string)
+			realm, bare := resolveModel(id)
+			if key.AllowsModel(realm, bare) {
+				filtered = append(filtered, it)
+			}
+		}
+		data = filtered
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   data,
 	})
 }
 
@@ -674,6 +687,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
 
+	// 密钥级模型白名单：名单外模型直接 403，不选号、不打上游、不扣额度。
+	// 未鉴权部署（密钥表为空）没有密钥身份 → 视为不限制；密钥名单为空同样不限制。
+	authKey, hasAuthKey := authKeyFrom(r.Context())
+	if bareModel != "" && !authKey.AllowsModel(realm, bareModel) {
+		modelNotAllowed(w, peek.Model, authKey.AllowedModels)
+		return
+	}
+
 	// 模型降级（pool.model_fallback）：curModel 是**本轮实际使用**的模型，初值 =
 	// 客户端请求的 bareModel；原模型被 6004 模型级限流、且配置了等价模型时，
 	// 同账号改用等价模型重试（curModel 改指向等价模型）。
@@ -695,6 +716,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		to := strings.TrimSpace(m[curModel])
 		if to == "" || to == curModel || fallbackTried[to] {
+			return ""
+		}
+		// 降级目标也必须在密钥白名单内：否则等于借 model_fallback 绕过模型限制。
+		if !authKey.AllowsModel(realm, to) {
 			return ""
 		}
 		return to
@@ -888,8 +913,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   - 在 upstream.prepareBody 之前（注入值仍会走 supportedEfforts 降级管线）。
 	// upstream 侧的全局 thinking.* 注入发现已有 reasoning_effort 会自动跳过，
 	// 于是优先级天然成立：客户端显式 > 密钥 per_model > 密钥默认 > 全局 per_model > 全局默认。
-	if key, ok := authKeyFrom(r.Context()); ok {
-		if override := keyThinkingOverride(key); override != nil {
+	if hasAuthKey {
+		if override := keyThinkingOverride(authKey); override != nil {
 			body = upstream.InjectDefaultThinkingEffort(body, override)
 		}
 	}

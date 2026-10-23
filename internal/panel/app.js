@@ -880,13 +880,13 @@ function renderRequestMetrics(m, entries) {
   renderRequestTable();
 }
 
-/* reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
+/* reqMatch 请求记录筛选：q 对 IP/UA/模型/档位/账号/请求 ID 做空格分词的 AND 包含匹配，
    outcome 精确匹配。两者都在已拉取的条目上做（最多 1000 条），不发新请求。 */
 function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.effort, e && e.account, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -931,6 +931,7 @@ function renderRequestTable() {
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td>' + (e && e.effort ? esc(e.effort) : '<span class="muted">—</span>') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -939,7 +940,7 @@ function renderRequestTable() {
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="10" class="empty">' +
+  }).join('') || '<tr><td colspan="11" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
   const filtered = list.length !== reqEntries.length;
@@ -984,6 +985,7 @@ function requestLogText(e) {
     when,
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
+    e && e.effort || '',
     e && e.account || '—',
     e && e.client_ip || '—',
     e && e.user_agent || '—',
@@ -1171,6 +1173,31 @@ let editingKeyID = '';
 
 function effortText(v) { return v ? esc(v) : '<span class="hint">跟随全局</span>'; }
 
+// 可用模型列：空 = 全部；过长时只显示前 3 个，完整清单放 title。
+function modelsCell(list) {
+  const arr = Array.isArray(list) ? list : [];
+  if (!arr.length) return '<span class="hint">全部</span>';
+  const brief = arr.slice(0, 3).join(', ') + (arr.length > 3 ? ' …' : '');
+  return '<span class="clip" title="' + esc(arr.join(', ')) + '">' + esc(brief) + '</span>';
+}
+
+// 白名单输入框解析：逗号 / 空白分隔，去空。
+function splitModels(v) {
+  return String(v || '').split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+}
+
+// 勾选框回填：输入框里的裸名等价于「两个域都允许」，对应域条目也显示为已选。
+function syncKeyModelChecks() {
+  const box = $('keyModelsList');
+  if (!box) return;
+  const cur = new Set(splitModels($('keyModels').value));
+  box.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    const v = cb.value;
+    const bare = v.includes(':') ? v.slice(v.indexOf(':') + 1) : v;
+    cb.checked = cur.has(v) || cur.has(bare);
+  });
+}
+
 async function loadKeys() {
   const tb = $('keysBody');
   try {
@@ -1178,7 +1205,7 @@ async function loadKeys() {
     const keys = d.keys || [];
     $('keysNote').textContent = d.auth_required ? keys.length + ' 把密钥' : '未启用鉴权';
     if (!keys.length) {
-      tb.innerHTML = '<tr><td colspan="6"><div class="empty"><div class="big">尚未配置密钥</div>当前网关无需鉴权；新增一把管理员密钥即可开启鉴权</div></td></tr>';
+      tb.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">尚未配置密钥</div>当前网关无需鉴权；新增一把管理员密钥即可开启鉴权</div></td></tr>';
       return;
     }
     tb.innerHTML = keys.map(k => {
@@ -1192,6 +1219,7 @@ async function loadKeys() {
       return '<tr><td>' + esc(k.name || '—') + (k.legacy ? ' <span class="hint">（旧版）</span>' : '') + '</td>' +
         '<td><code>' + esc(k.masked) + '</code></td>' +
         '<td>' + (k.admin ? '管理员' : '普通') + '</td>' +
+        '<td>' + modelsCell(k.allowed_models) + '</td>' +
         '<td>' + effortText(k.thinking_default_effort) + '</td>' +
         '<td>' + per + '</td>' +
         '<td class="num">' + ops + '</td></tr>';
@@ -1204,7 +1232,7 @@ async function loadKeys() {
       };
     });
   } catch (e) {
-    tb.innerHTML = '<tr><td colspan="6">读取失败：' + esc(e.message) + '</td></tr>';
+    tb.innerHTML = '<tr><td colspan="7">读取失败：' + esc(e.message) + '</td></tr>';
   }
 }
 
@@ -1219,6 +1247,9 @@ function openKeyForm(k) {
   $('keySecretHint').textContent = k ? '如需更换密钥，请删除后重建' : '创建后完整密钥只显示一次';
   $('keyEffort').value = k ? (k.thinking_default_effort || '') : '';
   $('keyPerModel').value = k && k.thinking_per_model ? JSON.stringify(k.thinking_per_model) : '';
+  $('keyModels').value = k && Array.isArray(k.allowed_models) ? k.allowed_models.join(', ') : '';
+  $('keyModelsPick').hidden = true;
+  $('keyModelsFilter').value = '';
   $('keyAdmin').checked = k ? !!k.admin : false;
 }
 
@@ -1247,6 +1278,8 @@ $('btnKeySave').onclick = async () => {
     admin: $('keyAdmin').checked,
     thinking_default_effort: $('keyEffort').value,
     thinking_per_model: per,
+    // 总是下发：空数组 = 清空（不限制）；编辑时输入框已回填现值，不会误清。
+    allowed_models: splitModels($('keyModels').value),
   };
   const btn = $('btnKeySave');
   btn.disabled = true; btn.textContent = '保存中…';
@@ -1267,6 +1300,56 @@ $('btnKeySave').onclick = async () => {
     loadKeys();
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存密钥'; }
+};
+
+/* 可用模型选择器：按需从上游实时目录拉取并缓存；勾选结果写回输入框。
+   拉取失败不阻塞保存——输入框可直接手填（目录会随上游变化）。 */
+let keyModelCatalog = null;
+$('btnKeyModelsLoad').onclick = async () => {
+  const pick = $('keyModelsPick'), btn = $('btnKeyModelsLoad');
+  if (!pick.hidden) { pick.hidden = true; return; }
+  btn.disabled = true; btn.textContent = '加载中…';
+  try {
+    if (!keyModelCatalog) {
+      const d = await api('models');
+      // 空结果不缓存：下次点开可重试（上游目录可能暂时拉不到）。
+      const ids = (d.models || []).map(m => m.id).filter(Boolean).sort();
+      keyModelCatalog = ids.length ? ids : null;
+    }
+    const ids = keyModelCatalog || [];
+    $('keyModelsList').innerHTML = ids.length
+      ? ids.map(id => '<label style="display:flex;gap:6px;align-items:center;font-size:12px">' +
+          '<input type="checkbox" value="' + esc(id) + '">' +
+          '<span class="clip" title="' + esc(id) + '">' + esc(id) + '</span></label>').join('')
+      : '<span class="hint">上游未返回模型；可直接在上方输入框手填。</span>';
+    $('keyModelsFilter').value = '';
+    pick.hidden = false;
+    syncKeyModelChecks();
+  } catch (e) {
+    toast('加载模型列表失败：' + e.message, 'err');
+  } finally { btn.disabled = false; btn.textContent = '从上游加载模型列表'; }
+};
+$('keyModelsList').addEventListener('change', ev => {
+  const cb = ev.target;
+  if (!cb || cb.type !== 'checkbox') return;
+  const cur = splitModels($('keyModels').value);
+  const bare = cb.value.includes(':') ? cb.value.slice(cb.value.indexOf(':') + 1) : cb.value;
+  let next;
+  if (cb.checked) {
+    if (!cur.includes(cb.value) && !cur.includes(bare)) cur.push(cb.value);
+    next = cur;
+  } else {
+    // 取消勾选同时移除该域条目与等价的裸名条目（裸名 = 两域都允许）。
+    next = cur.filter(m => m !== cb.value && m !== bare);
+  }
+  $('keyModels').value = next.join(', ');
+  syncKeyModelChecks();
+});
+$('keyModelsFilter').oninput = () => {
+  const q = $('keyModelsFilter').value.trim().toLowerCase();
+  $('keyModelsList').querySelectorAll('label').forEach(l => {
+    l.hidden = !!q && !l.textContent.toLowerCase().includes(q);
+  });
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */

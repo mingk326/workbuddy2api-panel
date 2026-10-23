@@ -101,6 +101,19 @@ func TestEffortLabel(t *testing.T) {
 	}
 }
 
+// TestRequestTraceEventEffort 面板「请求记录」的档位列与流水行 effort= 同源；
+// 无 stat（非 chat 路径）时不写档位。
+func TestRequestTraceEventEffort(t *testing.T) {
+	st := &chatStat{effortClient: "max", effortIn: "max", effortOut: "xhigh"}
+	ev := (&requestTrace{id: "req-effort", start: time.Now(), stat: st}).event(http.StatusOK)
+	if ev.Effort != "max->xhigh" {
+		t.Errorf("effort=%q want max->xhigh", ev.Effort)
+	}
+	if got := (&requestTrace{start: time.Now()}).event(http.StatusOK).Effort; got != "" {
+		t.Errorf("no stat effort=%q want empty", got)
+	}
+}
+
 // TestLogChatRowEffortSegment 流水行：有档位时追加 effort 段，无档位时旧格式不变。
 func TestLogChatRowEffortSegment(t *testing.T) {
 	withChatLog(t)

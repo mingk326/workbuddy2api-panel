@@ -70,6 +70,12 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		model = defaultImageModel
 	}
 	realm, bare := resolveModel(model)
+	// 密钥级模型白名单：名单外出图模型直接 403（先于下架/路由检查，
+	// 避免向无权限的密钥泄露模型可用性）。
+	if key, ok := authKeyFrom(r.Context()); ok && !key.AllowsModel(realm, bare) {
+		modelNotAllowed(w, model, key.AllowedModels)
+		return
+	}
 	// 已下架模型 → 直接 400 并指出替代（实测 14401 route config not found 会白烧每个账号）。
 	if upstream.ImageModelRetired(bare) {
 		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",

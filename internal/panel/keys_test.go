@@ -86,7 +86,8 @@ func TestKeysCRUD(t *testing.T) {
 
 	// 创建：留空密钥自动生成，完整值只在响应里出现一次。
 	rec = doPanel(p, "POST", "/panel/api/keys", "sk-legacy",
-		`{"name":"codex","thinking_default_effort":"max","thinking_per_model":{"glm-5.2":"low"}}`)
+		`{"name":"codex","thinking_default_effort":"max","thinking_per_model":{"glm-5.2":"low"},
+		  "allowed_models":[" glm-5.2 ","glm-5.2","","global:hy3"]}`)
 	if rec.Code != 200 {
 		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -109,6 +110,9 @@ func TestKeysCRUD(t *testing.T) {
 	if len(list.Keys) != 2 || list.Keys[0].DefaultEffort != "max" || list.Keys[0].PerModel["glm-5.2"] != "low" {
 		t.Fatalf("list after create = %+v", list.Keys)
 	}
+	if got := list.Keys[0].AllowedModels; len(got) != 2 || got[0] != "glm-5.2" || got[1] != "global:hy3" {
+		t.Fatalf("allowed_models 归一化 = %v want [glm-5.2 global:hy3]", got)
+	}
 
 	// 编辑：改名 + 提升为管理员。
 	rec = doPanel(p, "POST", "/panel/api/keys/update", "sk-legacy",
@@ -120,6 +124,18 @@ func TestKeysCRUD(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &list)
 	if list.Keys[0].Name != "codex2" || !list.Keys[0].Admin {
 		t.Fatalf("update not applied: %+v", list.Keys[0])
+	}
+
+	// 编辑白名单：显式空数组 = 清空为不限制（nil 才表示"不改"）。
+	rec = doPanel(p, "POST", "/panel/api/keys/update", "sk-legacy",
+		`{"id":"`+created.ID+`","allowed_models":[]}`)
+	if rec.Code != 200 {
+		t.Fatalf("update clear models code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = doPanel(p, "GET", "/panel/api/keys", "sk-legacy", "")
+	json.Unmarshal(rec.Body.Bytes(), &list)
+	if len(list.Keys[0].AllowedModels) != 0 {
+		t.Fatalf("allowed_models 未清空: %v", list.Keys[0].AllowedModels)
 	}
 
 	// legacy 不可删。

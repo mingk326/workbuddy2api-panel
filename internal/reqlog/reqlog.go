@@ -82,8 +82,12 @@ type Event struct {
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	// Effort 思考档位溯源（issue #43）：`max->xhigh`（客户端发 max 被降级）/
+	// `gw:max->xhigh`（网关注入后降级）/ `high`（一致）；空 = 未参与档位处理
+	//（旧归档、非 chat 路径或客户端与网关都未指定档位）。
+	Effort    string `json:"effort,omitempty"`
+	ClientIP  string `json:"client_ip,omitempty"`
+	UserAgent string `json:"user_agent,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

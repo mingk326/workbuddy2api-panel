@@ -101,6 +101,9 @@ func cloneKeys(in []httpauth.Key) []httpauth.Key {
 			}
 			k.PerModel = m
 		}
+		if len(k.AllowedModels) > 0 {
+			k.AllowedModels = append([]string(nil), k.AllowedModels...)
+		}
 		out[i] = k
 	}
 	return out

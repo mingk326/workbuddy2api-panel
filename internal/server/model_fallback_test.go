@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -76,6 +78,60 @@ func TestModelFallbackOn6004(t *testing.T) {
 	}
 	if p.ModelBlocked("backup-model").Blocked {
 		t.Error("等价模型不应被冷却（降级就白做了）")
+	}
+}
+
+// TestModelFallbackRespectsAllowedModels 降级目标不在密钥白名单内 → 不降级，
+// 否则等于借 model_fallback 绕过模型限制。
+func TestModelFallbackRespectsAllowedModels(t *testing.T) {
+	var mu sync.Mutex
+	var sent []string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			var obj map[string]any
+			_ = json.Unmarshal(raw, &obj)
+			m, _ := obj["model"].(string)
+			mu.Lock()
+			sent = append(sent, m)
+			mu.Unlock()
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"code":6004,"msg":"将在 2099-01-01 00:00:00 UTC+8 重置"}`)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
+	live := livecfg.New(livecfg.Snapshot{APIKeys: []httpauth.Key{
+		{ID: "codex", Secret: "sk-codex", AllowedModels: []string{"origin-model"}},
+	}})
+	h := NewHandler(Config{
+		Pool:     p,
+		Upstream: up,
+		Live:     live,
+		ModelFallback: func() map[string]string {
+			return map[string]string{"origin-model": "backup-model"}
+		},
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"origin-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-codex")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("降级目标不在白名单内时不应成功: %s", rec.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, m := range sent {
+		if m == "backup-model" {
+			t.Fatalf("不应降级到名单外模型: %v", sent)
+		}
 	}
 }
 

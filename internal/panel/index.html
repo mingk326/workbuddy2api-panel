@@ -1146,13 +1146,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <!-- 多密钥与按密钥思考档位（独立于上方整份配置表单） -->
       <div class="box">
-        <header><h3>API 密钥与思考档位</h3><span class="grow"></span>
+        <header><h3>API 密钥、模型与思考档位</h3><span class="grow"></span>
           <span class="note" id="keysNote">—</span>
           <button type="button" class="xs" id="btnKeyAdd">新增密钥</button></header>
         <div class="tbl-wrap">
           <table class="acc zebra">
             <thead><tr><th>名称</th><th>密钥</th><th>面板权限</th>
-              <th>默认档位</th><th>模型覆盖</th><th class="num">操作</th></tr></thead>
+              <th>可用模型</th><th>默认档位</th><th>模型覆盖</th><th class="num">操作</th></tr></thead>
             <tbody id="keysBody"></tbody>
           </table>
         </div>
@@ -1182,6 +1182,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="switch" style="align-self:end"><span class="lb">管理员（可进面板）</span>
               <input type="checkbox" id="keyAdmin"></div>
           </div>
+          <div class="hr"></div>
+          <div class="grid2">
+            <label class="fld"><span class="lb">可用模型（留空 = 全部）</span>
+              <input id="keyModels" placeholder="glm-5.3, global:hy-image-3.5">
+              <span class="hint">逗号分隔；裸名对 cn/global 两个域都生效，带前缀只限定该域</span></label>
+            <div style="align-self:end">
+              <button type="button" class="xs" id="btnKeyModelsLoad">从上游加载模型列表</button>
+            </div>
+          </div>
+          <div id="keyModelsPick" hidden>
+            <input id="keyModelsFilter" type="search" placeholder="筛选模型…" aria-label="筛选模型">
+            <div id="keyModelsList" style="max-height:180px;overflow:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:6px 14px;margin-top:8px"></div>
+            <div class="hint">勾选即写入上方输入框；列表来自上游实时目录，拉取失败时可直接手填。</div>
+          </div>
           <div class="inline" style="justify-content:flex-end">
             <button type="button" id="btnKeyCancel">取消</button>
             <button type="button" class="primary" id="btnKeySave">保存密钥</button>
@@ -1192,7 +1206,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="pad">
           <div class="hint">优先级：客户端显式档位 &gt; 密钥「按模型」&gt; 密钥「默认」&gt; 全局 thinking.* &gt; 模型默认。
-            普通密钥只能调用 <code>/v1/*</code>；<b>管理员</b>密钥才能进入本面板。旧版 <code>api_key</code> 恒为管理员，只读展示。</div>
+            普通密钥只能调用 <code>/v1/*</code>；<b>管理员</b>密钥才能进入本面板。旧版 <code>api_key</code> 恒为管理员，只读展示。
+            <br>「可用模型」留空 = 不限制；名单外模型直接 403（<code>model_not_allowed</code>），<code>/v1/models</code> 也只返回名单内模型。</div>
         </div>
       </div>
     </section>
@@ -1207,7 +1222,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="reqNote">—</span>
         </header>
         <div class="fbar" id="reqFilter">
-          <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID" aria-label="搜索请求记录">
+          <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 档位 / 账号 / 请求 ID" aria-label="搜索请求记录">
           <select id="reqOutcome" aria-label="按结果筛选">
             <option value="">全部结果</option>
             <option value="success">成功</option>
@@ -1228,7 +1243,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap req-wrap">
           <table class="acc req">
             <thead><tr>
-              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
+              <th>时间</th><th>结果</th><th>模型</th><th>档位</th><th>账号</th>
               <th>来源 IP</th><th>User-Agent</th>
               <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
             </tr></thead>

@@ -438,6 +438,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		// 请求记录页的思考档位列：与流水行 effort= 同一套溯源渲染（issue #43）。
+		e.Effort = effortLabel(s.effortClient, s.effortIn, s.effortOut)
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent

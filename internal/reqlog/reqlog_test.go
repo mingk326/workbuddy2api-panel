@@ -7,6 +7,24 @@ import (
 	"time"
 )
 
+// Effort 档位溯源随请求记录落盘并读回：面板「请求记录」的档位列依赖该字段。
+func TestArchivePersistsEffort(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, MaxBytes: 1 << 20, RetentionDays: 7})
+	r.Record(Event{
+		Time: time.Now(), RequestID: "req-effort", Model: "glm-5.3",
+		Status: 200, OK: true, Outcome: OutcomeSuccess, Effort: "gw:max->xhigh",
+	})
+	r.Close()
+	rows, err := r.ReadArchive(10, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Effort != "gw:max->xhigh" {
+		t.Fatalf("effort roundtrip = %+v", rows)
+	}
+}
+
 func TestRecorderMetricsAndRecent(t *testing.T) {
 	r := New(Config{})
 	r.Begin()
