@@ -2,7 +2,8 @@
 <html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
 <title>WorkBuddy2API · 控制台</title>
 <style>
 /* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
@@ -589,6 +590,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .exp-main.err { color: var(--bad); }
 
 </style>
+<link rel="stylesheet" href="mobile.css">
 </head>
 <body>
 <div class="shell">
@@ -1286,6 +1288,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <pre id="logBox"></pre>
       </div>
     </section>
+
+    <!-- 更多功能收纳：移动端通过底部「更多」进入；桌面仍使用左侧导航。 -->
+    <section class="view mobile-more-view" id="view-more" hidden>
+      <div class="box">
+        <header><h3>更多功能</h3></header>
+        <div class="mobile-more-list">
+          <button data-go="packages"><span>积分构成<small>到期提醒与套餐明细</small></span><b>›</b></button>
+          <button data-go="config"><span>密钥与配置<small>密钥配额、调度、账号池与日志</small></span><b>›</b></button>
+          <button data-go="logs"><span>请求记录与运行日志<small>按密钥、模型、状态排查请求</small></span><b>›</b></button>
+          <button id="mobileMoreRefresh"><span>刷新全部余额<small>同步所有账号最新积分</small></span><b>↻</b></button>
+          <button id="mobileMoreTheme"><span>切换显示主题<small>浅色 / 深色</small></span><b>◐</b></button>
+          <button id="mobileMoreAdd"><span>添加账号<small>OAuth 浏览器登录或导入 JSON</small></span><b>＋</b></button>
+        </div>
+      </div>
+      <div class="box"><div class="pad"><div class="hint">当前版本 <span id="mobileMoreVersion">v-</span> · 移动端 A 方案</div></div></div>
+    </section>
   </div>
 </div>
 
@@ -1400,6 +1418,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <div id="toasts"></div>
 
+<!-- 移动端 A 方案：五栏导航。与桌面侧栏共用 data-view/go()，不另建路由。 -->
+<nav class="mobile-nav" id="mobileNav" aria-label="移动端主导航">
+  <button data-view="accounts" class="on"><span aria-hidden="true">▦</span>账号池</button>
+  <button data-view="usage"><span aria-hidden="true">⌁</span>用量</button>
+  <button data-view="taskscenter"><span aria-hidden="true">✓</span>任务</button>
+  <button data-view="models"><span aria-hidden="true">◇</span>模型</button>
+  <button data-view="more"><span aria-hidden="true">☰</span>更多</button>
+</nav>
+<button class="mobile-add" id="mobileAdd" aria-label="添加账号" title="添加账号">+</button>
+<!-- 账号详情：仅移动端全屏展示。操作复用账号表同一组 data-a 按钮。 -->
+<div class="mobile-detail" id="mobileAccountDetail" hidden role="dialog" aria-modal="true" aria-labelledby="mobileDetailName">
+  <header class="mobile-detail-head">
+    <button class="ghost" id="mobileDetailBack" aria-label="返回账号池">‹</button>
+    <h2>账号详情</h2>
+    <button class="ghost" id="mobileDetailClose" aria-label="关闭">×</button>
+  </header>
+  <div class="mobile-detail-body" id="mobileDetailBody"></div>
+</div>
+<script src="mobile.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

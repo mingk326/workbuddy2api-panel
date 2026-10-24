@@ -1,0 +1,218 @@
+/* 移动端 A 方案：桌面端不显示任何新增壳层元素。 */
+.mobile-nav, .mobile-add, .mobile-detail, .mobile-more-view { display: none; }
+
+@media (max-width: 760px) {
+  html, body { max-width: 100%; overflow-x: hidden; }
+  body { font-size: 15px; }
+  .shell { display: block; min-height: 100svh; }
+  .nav { display: none; }
+  .main { display: block; }
+  .topbar { min-height: 58px; padding: 10px 16px; gap: 10px; }
+  .topbar h2 { font-size: 17px; }
+  .topbar .sep, .topbar .meta, .topbar #btnTheme, .topbar #btnAdd { display: none; }
+  .topbar #btnRefresh { min-width: 52px; min-height: 40px; }
+  .view { max-width: 680px; padding: 16px 14px 100px; }
+  .box { margin-bottom: 16px; border-radius: 12px; }
+  .box > header { flex-wrap: wrap; gap: 8px; padding: 12px 14px; }
+  .box > header h3 { font-size: 14px; white-space: normal; }
+  .box > header h3 .hint { display: block; margin: 3px 0 0; line-height: 1.5; }
+  .box .pad { padding: 14px; }
+  .hint { overflow-wrap: anywhere; }
+  button { min-height: 40px; }
+  button.xs { min-height: 34px; padding: 6px 10px; }
+  input, select { min-height: 42px; font-size: 16px; }
+  .tbl-wrap { -webkit-overflow-scrolling: touch; }
+  .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 16px; }
+  .stat { padding: 13px 12px; }
+  .stat .v { font-size: 22px; overflow-wrap: anywhere; white-space: normal; }
+  .stat:nth-child(5), .stat:nth-child(6), .stat:nth-child(7) { grid-column: span 1; }
+  .stat .k { font-size: 10.5px; }
+  .kpis, .kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px 12px 2px; gap: 8px; }
+  .kpi { padding: 10px 10px 11px 13px; }
+  .kpi .v { font-size: 20px; }
+  .uschart-hd { flex-wrap: wrap; }
+  .uschart-hd .legend { flex-wrap: wrap; }
+  .grid2, .grid3 { grid-template-columns: 1fr; }
+  .inline { flex-wrap: wrap; }
+  .inline input { min-width: 0; }
+  .fbar { padding: 10px 12px; }
+  .fbar > input[type=search] { min-width: 0; flex: 1 1 100%; }
+  .fbar > select { flex: 1 1 42%; }
+  .fbar .trange { width: 100%; }
+  .trange .tr-custom { flex-wrap: wrap; }
+  .trange input { min-width: 0; max-width: 100%; }
+  .exp-row { flex-wrap: wrap; }
+  .exp-nm { min-width: 0; }
+  .exp-main { flex: 1 1 200px; }
+  .qprog { padding: 12px 14px 0; }
+  .qrow { grid-template-columns: minmax(0, 1fr) auto; gap: 5px 10px; padding: 11px 14px; }
+  .qrow .code { grid-column: 1; grid-row: 1; }
+  .qrow .name { grid-column: 1 / -1; grid-row: 2; }
+  .qrow .prog { grid-column: 2; grid-row: 1; }
+  .qrow .st { grid-column: 1; grid-row: 3; }
+  .qrow .msg { grid-column: 1 / -1; grid-row: 4; white-space: normal; }
+  .shead { display: none; }
+  .srow { grid-template-columns: 1fr; gap: 10px; padding: 14px; }
+  .stasks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .savebar { bottom: 67px; flex-wrap: wrap; z-index: 10; }
+  .savebar .grow, .savebar .restart-note { display: none; }
+  .savebar button { flex: 1; }
+  #logBox { font-size: 11px; padding: 12px; }
+  #reqSummary, #reqNote { flex: 1 1 100%; text-align: left; white-space: normal; }
+  .pk-card { flex-basis: 100%; min-width: 0; }
+  .pk-card .who { flex-wrap: wrap; }
+  .pk-expiry-hdr, .pk-expiry-row { grid-template-columns: 56px minmax(60px, 1fr) 65px; gap: 6px; }
+  .vc .ft { flex-wrap: wrap; }
+  .vc .ft code { max-width: 100%; overflow-wrap: anywhere; }
+
+  /* 账号表只在窄屏变为摘要卡片；桌面表格和按钮保持原样。 */
+  #view-accounts > .box:has(#accBody) .tbl-wrap { overflow: visible; }
+  #accBody, #accBody tr, #accBody td { display: block; }
+  #accBody { padding: 8px; }
+  #view-accounts > .box:has(#accBody) thead { display: none; }
+  #view-accounts > .box:has(#accBody) table { min-width: 0; }
+  #accBody tr[data-account-uid] {
+    position: relative; display: grid;
+    grid-template-columns: 3px minmax(0, 1fr) auto;
+    grid-template-areas: "mark who cred" "mark state state";
+    gap: 9px 12px; align-items: center;
+    min-height: 104px; padding: 15px 14px; margin-bottom: 8px;
+    background: var(--surface-2); border: 1px solid var(--line-soft);
+    border-radius: 11px; cursor: pointer; -webkit-tap-highlight-color: transparent;
+  }
+  #accBody tr[data-account-uid]:last-child { margin-bottom: 0; }
+  #accBody tr[data-account-uid]:active { border-color: var(--accent); }
+  #accBody tr[data-account-uid] td {
+    padding: 0; border: 0; width: auto; min-width: 0; max-width: none;
+  }
+  #accBody tr[data-account-uid] td.mark { grid-area: mark; align-self: stretch; width: 3px; min-width: 3px; }
+  #accBody tr[data-account-uid] td.mark i { height: 100%; min-height: 66px; border-radius: 2px; }
+  #accBody tr[data-account-uid] td.who { grid-area: who; min-width: 0; max-width: none; }
+  #accBody tr[data-account-uid] td.who::before {
+    content: ''; float: left; width: 38px; height: 38px; margin-right: 10px;
+    background: var(--accent-soft); border-radius: 10px;
+  }
+  #accBody .who .nm { margin-left: 48px; font-size: 15px; line-height: 22px; white-space: normal; }
+  #accBody .who .id { margin-left: 48px; font-size: 10.5px; line-height: 16px; }
+  #accBody .realm-tag { margin-left: 4px; }
+  #accBody tr[data-account-uid] td:nth-child(3) {
+    grid-area: state; padding-left: 48px; min-width: 0;
+  }
+  #accBody tr[data-account-uid] td:nth-child(3)::after {
+    content: '查看详情 ›'; float: right; margin-left: 8px;
+    color: var(--ink-3); font-size: 11px; white-space: nowrap;
+  }
+  #accBody tr[data-account-uid] td:nth-child(3) .hint { font-size: 11px !important; }
+  #accBody tr[data-account-uid] td.cred { grid-area: cred; min-width: 82px; text-align: right; }
+  #accBody .cred .n { font-size: 17px; }
+  #accBody .cred .n::after { content: '剩余积分'; display: block; margin-top: 3px; font: 10px var(--sans); color: var(--ink-3); }
+  #accBody .cred .bar { margin-left: auto; max-width: 100px; }
+  #accBody tr[data-account-uid] td:nth-child(n+5) { display: none; }
+  #accBody .rate-limits { min-width: 0; }
+  #accBody .rate-limit { flex-wrap: wrap; }
+  #accBody > tr:not([data-account-uid]) > td { padding: 20px; }
+
+  .mobile-nav {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+    display: flex; max-width: 680px; margin: 0 auto;
+    padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
+    background: color-mix(in srgb, var(--surface) 96%, transparent);
+    border-top: 1px solid var(--line); backdrop-filter: blur(14px);
+  }
+  .mobile-nav button {
+    flex: 1; min-width: 0; min-height: 54px; padding: 5px 2px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; border: 0; border-radius: 8px; background: transparent;
+    color: var(--ink-3); font-size: 10px;
+  }
+  .mobile-nav button span { font: 20px/20px var(--mono); }
+  .mobile-nav button.on { color: var(--accent); background: var(--accent-soft); }
+  body.mobile-add-visible:not(.mobile-detail-open) .mobile-add {
+    position: fixed; right: max(16px, calc((100vw - 680px) / 2 + 16px));
+    bottom: calc(80px + env(safe-area-inset-bottom)); z-index: 39;
+    display: grid; place-items: center; width: 48px; height: 48px; min-height: 48px;
+    padding: 0 0 3px; border: 0; border-radius: 15px;
+    background: var(--accent); color: var(--accent-ink);
+    box-shadow: 0 6px 18px var(--accent-soft), 0 4px 12px rgba(0,0,0,.25);
+    font-size: 30px; font-weight: 300;
+  }
+  body:not(.mobile-add-visible) .mobile-add, body.mobile-detail-open .mobile-add { display: none; }
+  body:has(.view:not([hidden]):not(#view-accounts)) .mobile-add { display: none; }
+  .mobile-more-view:not([hidden]) { display: block; }
+  .mobile-more-list { padding: 6px; }
+  .mobile-more-list > button {
+    display: flex; align-items: center; width: 100%; min-height: 68px;
+    padding: 12px; border: 0; border-radius: 8px; background: transparent; text-align: left;
+  }
+  .mobile-more-list > button + button { border-top: 1px solid var(--line-soft); border-radius: 0; }
+  .mobile-more-list > button > span { flex: 1; font-size: 14px; }
+  .mobile-more-list small { display: block; margin-top: 3px; color: var(--ink-3); font-size: 11px; }
+  .mobile-more-list b { margin-left: 12px; color: var(--ink-3); font-size: 20px; font-weight: 400; }
+
+  .mobile-detail {
+    position: fixed; inset: 0; z-index: 50; overflow-y: auto;
+    background: var(--bg); overscroll-behavior: contain;
+  }
+  .mobile-detail:not([hidden]) { display: block; }
+  .mobile-detail-head {
+    position: sticky; top: 0; z-index: 2; display: flex; align-items: center;
+    min-height: 58px; padding: 6px 10px; background: var(--surface);
+    border-bottom: 1px solid var(--line);
+  }
+  .mobile-detail-head h2 { flex: 1; text-align: center; font-size: 16px; }
+  .mobile-detail-head button { width: 44px; min-height: 44px; padding: 0; border: 0; font-size: 28px; }
+  .mobile-detail-body { max-width: 680px; margin: 0 auto; padding: 18px 14px 40px; }
+  .mobile-account-hero {
+    padding: 22px 18px; text-align: center; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);
+  }
+  .mobile-avatar {
+    display: grid; place-items: center; width: 52px; height: 52px; margin: 0 auto 12px;
+    background: var(--accent-soft); color: var(--accent); border-radius: 14px;
+    font-size: 20px; font-weight: 650;
+  }
+  .mobile-account-hero h2 { font-size: 20px; overflow-wrap: anywhere; }
+  .mobile-uid { margin: 6px 0 12px; color: var(--ink-3); font: 11px var(--mono); overflow-wrap: anywhere; }
+  .mobile-credit { margin-top: 19px; font: 600 32px/1.1 var(--mono); }
+  .mobile-credit small { display: block; margin-top: 6px; color: var(--ink-3); font: 11px var(--sans); }
+  .mobile-facts {
+    margin-top: 14px; padding: 0 14px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 12px;
+  }
+  .mobile-facts > div { display: flex; justify-content: space-between; gap: 12px; padding: 13px 0; }
+  .mobile-facts > div + div { border-top: 1px solid var(--line-soft); }
+  .mobile-facts span { color: var(--ink-3); font-size: 12px; }
+  .mobile-facts b { text-align: right; font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+  .mobile-account-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 18px; }
+  .mobile-account-actions button { min-height: 46px; padding: 10px 6px; }
+  body.mobile-detail-open { overflow: hidden; }
+  body.mobile-detail-open #mobileNav { display: none; }
+  body.mobile-detail-open .veil.on { z-index: 60; }
+
+  .veil.on { align-items: flex-end; padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); }
+  .dlg { width: 100% !important; max-height: 92svh; border-radius: 15px; }
+  .dlg header { padding: 15px 16px 12px; }
+  .dlg .body { padding: 15px 16px; }
+  .dlg footer { flex-wrap: wrap; padding: 12px 16px; gap: 8px; }
+  .dlg footer button { flex: 1 1 auto; }
+  .dlg .tabs { display: flex; margin: 12px 0 0; }
+  .dlg .tabs .tab { flex: 1; min-height: 38px; }
+  .tab-panel + .tab-panel { margin: 0 -16px; padding: 14px 16px 0; }
+  #toasts { left: 14px; right: 14px; bottom: calc(82px + env(safe-area-inset-bottom)); align-items: stretch; }
+  .tst { max-width: none; }
+  body.mobile-detail-open #toasts { bottom: 18px; }
+}
+
+@media (max-width: 420px) {
+  .view { padding-left: 12px; padding-right: 12px; }
+  .stat { padding: 12px 9px; }
+  .stat .v { font-size: 20px; }
+  #accBody { padding: 6px; }
+  #accBody tr[data-account-uid] { padding: 13px 11px; gap: 8px 10px; }
+  #accBody tr[data-account-uid] td.cred { min-width: 74px; }
+  #accBody .cred .n { font-size: 15px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mobile-nav, .mobile-add, .mobile-detail { transition: none; }
+}

@@ -24,13 +24,15 @@ func TestAppJSSyntax(t *testing.T) {
 	if err != nil {
 		t.Skip("node not available; skipping JS syntax check")
 	}
-	path, err := filepath.Abs("app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := exec.Command(node, "--check", path).CombinedOutput()
-	if err != nil {
-		t.Fatalf("app.js syntax error:\n%s", out)
+	for _, name := range []string{"app.js", "mobile.js"} {
+		path, err := filepath.Abs(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command(node, "--check", path).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s syntax error:\n%s", name, out)
+		}
 	}
 }
 
@@ -59,6 +61,31 @@ func TestIndexHTMLNoInlineScript(t *testing.T) {
 			t.Fatalf("index.html contains inline <script> (blocked by CSP): %s", tag)
 		}
 		rest = rest[end:]
+	}
+}
+
+func TestMobileStaticAssets(t *testing.T) {
+	p := newTestPanel()
+	for _, tc := range []struct {
+		path, contentType string
+		want              []byte
+	}{
+		{"/panel/mobile.css", "text/css", mobileCSS},
+		{"/panel/mobile.js", "text/javascript", mobileJS},
+	} {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", tc.path, nil))
+		if rec.Code != 200 || !strings.HasPrefix(rec.Header().Get("Content-Type"), tc.contentType) {
+			t.Errorf("GET %s code=%d Content-Type=%q", tc.path, rec.Code, rec.Header().Get("Content-Type"))
+		}
+		if !bytes.Equal(rec.Body.Bytes(), tc.want) {
+			t.Errorf("GET %s 未返回内嵌资源", tc.path)
+		}
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	if body := rec.Body.String(); !strings.Contains(body, `href="mobile.css"`) || !strings.Contains(body, `src="mobile.js"`) {
+		t.Error("面板页面缺少移动端样式或脚本引用")
 	}
 }
 
@@ -91,7 +118,7 @@ const sandbox = new Proxy({
   fetch: () => new Promise(() => {}),
   addEventListener() {}, removeEventListener() {},
   matchMedia: () => ({ matches: false, addEventListener() {} }),
-  setInterval, clearInterval, setTimeout, clearTimeout,
+  setInterval, clearInterval, setTimeout, clearTimeout, scrollTo() {},
   console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
 }, { get(t, k) { return t[k]; }, has() { return true; } });
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
@@ -113,7 +140,7 @@ try {
 		t.Fatal(err)
 	}
 	hf.Close()
-	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages"} {
+	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages", "#more"} {
 		cmd := exec.Command(node, hf.Name(), "app.js")
 		cmd.Dir = "." // 测试工作目录 = internal/panel
 		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)

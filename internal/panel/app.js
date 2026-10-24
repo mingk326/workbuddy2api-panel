@@ -367,8 +367,9 @@ function invalidatePackages() {
   lastPackagesAt = 0;
 }
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志', more: '更多功能' };
 function go(v) {
+  if (!(v in TITLES) || (typeof MobilePanel !== 'undefined' && !MobilePanel.mobile() && v === 'more')) v = 'accounts';
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
@@ -382,6 +383,8 @@ function go(v) {
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
   if (v === 'taskscenter') reattachQueueView();
+  if (typeof MobilePanel !== 'undefined') MobilePanel.syncNav(v);
+  window.scrollTo(0, 0);
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -459,7 +462,7 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
-    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
+    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '" data-account-uid="' + esc(s.uid) + '" tabindex="0" role="button" aria-label="查看账号详情">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + (s.api_key ? ' <span class="realm-tag">API Key</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + offBadge + '</td>' +
@@ -535,6 +538,7 @@ async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
+    if (typeof MobilePanel !== 'undefined') MobilePanel.update(d);
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
@@ -547,6 +551,7 @@ async function loadOverview(quiet) {
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
+    if ($('mobileMoreVersion')) $('mobileMoreVersion').textContent = 'v' + d.version;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
@@ -581,9 +586,37 @@ async function editModelOff(u) {
   toast(add.length || del.length ? '模型开关已更新：手动关闭 ' + next.length + ' 个' : '未变更', 'ok');
 }
 
-$('accBody').addEventListener('click', async ev => {
+$('mobileDetailBody').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
+  ev.preventDefault();
+  accountAction(b);
+});
+document.querySelectorAll('#view-more [data-go]').forEach(b => b.addEventListener('click', () => {
+  go(b.dataset.go);
+  history.replaceState(null, '', '#' + b.dataset.go);
+}));
+$('mobileMoreRefresh').onclick = () => $('btnRefresh').click();
+$('mobileMoreTheme').onclick = () => $('btnTheme').click();
+$('mobileMoreAdd').onclick = () => $('btnAdd').click();
+$('accBody').addEventListener('keydown', ev => {
+  if (ev.key !== 'Enter' && ev.key !== ' ') return;
+  const row = ev.target.closest('tr[data-account-uid]');
+  if (!row || ev.target.closest('button')) return;
+  ev.preventDefault();
+  if (typeof MobilePanel !== 'undefined') MobilePanel.open(row.dataset.accountUid);
+});
+
+$('accBody').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-a]');
+  if (b) { accountAction(b); return; }
+  const row = ev.target.closest('tr[data-account-uid]');
+  if (row && typeof MobilePanel !== 'undefined') MobilePanel.open(row.dataset.accountUid);
+});
+
+// 桌面与移动详情共用同一处理函数；详情不再依赖对应桌面按钮的渲染时序。
+async function accountAction(b) {
+  if (b.disabled) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
@@ -625,7 +658,7 @@ $('accBody').addEventListener('click', async ev => {
     if (a !== 'tasks') invalidatePackages();     // 账号动作会改 token/余额/池状态
     loadOverview(true);
   }
-});
+}
 
 $('btnCheckinAll').onclick = async () => {
   try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }
