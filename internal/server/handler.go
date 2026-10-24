@@ -73,6 +73,10 @@ type Config struct {
 	// 热改走 Live 快照（HiddenModels），本字段只用于未接 Live 的静态路径。
 	ModelsHidden []string
 
+	// ModelsAliases 模型映射原始条目（config models.aliases，"客户端名=真实名"）。
+	// 热改走 Live 快照（ModelAliases），本字段只用于未接 Live 的静态路径。
+	ModelsAliases []string
+
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
@@ -167,6 +171,8 @@ type Handler struct {
 
 	// modelsHidden 静态配置下的黑名单集合（Live 快照优先；见 hiddenModel）。
 	modelsHidden map[string]struct{}
+	// modelAliases 静态配置下的别名表（Live 快照优先；见 modelAlias）。
+	modelAliases map[string]string
 }
 
 // NewHandler 构建 handler。
@@ -184,7 +190,8 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), budget: newDailyBudget(cfg.BudgetLimit), taskRunning: map[string]bool{},
-		modelsHidden: livecfg.NormalizeHiddenModels(cfg.ModelsHidden)}
+		modelsHidden: livecfg.NormalizeHiddenModels(cfg.ModelsHidden),
+		modelAliases: livecfg.NormalizeModelAliases(cfg.ModelsAliases)}
 	h.budget.applyConfig(cfg.BudgetLimit, cfg.BudgetBurstLimit, cfg.BudgetCacheLowRate)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
@@ -539,6 +546,21 @@ func (h *Handler) hiddenModel(realm, bare string) bool {
 	return hide
 }
 
+// modelAlias 查 models.aliases 映射：返回目标真实模型名（原样，可带 realm 前缀）。
+// 查找键与 livecfg.NormalizeModelAliases 的归一化口径配对：realm+":"+小写裸名。
+func (h *Handler) modelAlias(realm, bare string) (string, bool) {
+	if bare == "" {
+		return "", false
+	}
+	key := strings.ToLower(realm) + ":" + strings.ToLower(bare)
+	if h.cfg.Live != nil {
+		target, ok := h.cfg.Live.Load().ModelAliases[key]
+		return target, ok
+	}
+	target, ok := h.modelAliases[key]
+	return target, ok
+}
+
 // modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
 // 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
@@ -746,6 +768,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+	origRealm, origBare := realm, bareModel
+	// models.aliases 映射：客户端名命中映射 → 出站/选号/effort 全部改用目标名，
+	// realm 也按目标重解析（别名值可带前缀跨域指向）。放在 hidden 检查**之前**：
+	// 被映射到的目标仍受黑名单约束，别名不能绕过隐藏。
+	// modelEcho 非空 = 本请求走了映射，响应侧（SSE 帧 / 聚合体）把 model 覆写回
+	// 客户端原发名。
+	modelEcho := ""
+	if aliasTarget, aliased := h.modelAlias(realm, bareModel); aliased && aliasTarget != "" {
+		var obj map[string]any
+		if json.Unmarshal(body, &obj) == nil {
+			if cur, isStr := obj["model"].(string); isStr && cur == peek.Model {
+				obj["model"] = aliasTarget
+				if nb, merr := json.Marshal(obj); merr == nil {
+					body = nb
+					realm, bareModel = resolveModel(aliasTarget)
+					modelEcho = peek.Model
+					log.Printf("INFO: [server] model alias applied: %s -> %s", peek.Model, aliasTarget)
+				}
+			}
+		}
+	}
 	// 密钥身份：白名单、每日配额、档位注入共用同一次解析。
 	authKey, hasAuthKey := authKeyFrom(r.Context())
 
@@ -775,7 +818,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			peek.Model+" 已被网关配置隐藏（models.hidden），请换一个模型")
 		return
 	}
-	if bareModel != "" && !authKey.AllowsModel(realm, bareModel) {
+	// 密钥白名单按「真实模型」判定；若管理员显式把客户端别名写进白名单，
+	// 也允许（避免别名 + 白名单组合下出现看似矛盾的 403）。
+	allowedByKey := authKey.AllowsModel(realm, bareModel) ||
+		(modelEcho != "" && authKey.AllowsModel(origRealm, origBare))
+	if bareModel != "" && !allowedByKey {
 		// 先落状态再拒绝：st.done() 的流水行与 requestTrace.event 的归档事件
 		// 都从 st 取状态，这样 403 会带着请求模型出现在两处。
 		st.status = http.StatusForbidden
@@ -1362,7 +1409,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
-				upstream.WithMarkupRepair(repair))
+				upstream.WithMarkupRepair(repair),
+				upstream.WithModelEcho(modelEcho))
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
@@ -1477,6 +1525,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+		}
+		if modelEcho != "" {
+			resp["model"] = modelEcho // 别名回显：响应用客户端原发名
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK

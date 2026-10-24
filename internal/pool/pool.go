@@ -49,6 +49,10 @@ type Pool struct {
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
 	creditFloor int64
+	// reserveCredits 保留积分阈值（SetReserveCredits 注入；0 = 关闭）。
+	// 余额**已知**且 <= 阈值的账号停止接单（所有模型，含免费模型），避免余额被
+	// 用到 0 触发上游提醒；仍在池中照常签到/旅行，充值后自动恢复。
+	reserveCredits int64
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
@@ -225,6 +229,23 @@ func (p *Pool) SetCreditFloor(n int64) {
 	if n >= 0 {
 		p.creditFloor = n
 	}
+}
+
+// SetReserveCredits 注入保留积分阈值（pool.reserve_credits；0 = 关闭）。
+// 余额已知且 <= 阈值时该账号退出选号（所有模型），充値/签到回血后自动恢复。
+func (p *Pool) SetReserveCredits(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.reserveCredits = n
+	}
+}
+
+// ReserveCredits 透出生效的保留积分阈值（/status 用）。0 = 关闭。
+func (p *Pool) ReserveCredits() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.reserveCredits
 }
 
 // SetModelRateOf 注入上游目录积分倍率查表（main 用 upstream.Client.ModelRate 装配）。

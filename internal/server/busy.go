@@ -49,9 +49,13 @@ func (h *Handler) chatBusy(w http.ResponseWriter, r *http.Request) {
 	// 客户端把它当成可选模型）。未鉴权/名单为空 = 不限制。
 	key, hasKey := authKeyFrom(r.Context())
 	for _, m := range req.Models {
-		realm, bare := resolveModel(m)
+		origRealm, origBare := resolveModel(m)
+		realm, bare := origRealm, origBare
+		if target, ok := h.modelAlias(realm, bare); ok && target != "" {
+			realm, bare = resolveModel(target)
+		}
 		lvl := busyLevelUnknown
-		allowed := (!hasKey || key.AllowsModel(realm, bare)) && !h.hiddenModel(realm, bare)
+		allowed := (!hasKey || key.AllowsModel(realm, bare) || key.AllowsModel(origRealm, origBare)) && !h.hiddenModel(realm, bare)
 		if allowed {
 			if _, ok := known[bare]; ok {
 				if h.cfg.Pool != nil && h.cfg.Pool.ModelBlockedForRealm(bare, realm).Blocked {

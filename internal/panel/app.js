@@ -424,6 +424,10 @@ function renderAccounts(list) {
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
+    const offs = s.model_off || [];
+    const offBadge = offs.length
+      ? '<div class="hint" style="font-size:11.5px;color:var(--warn);margin-top:3px" title="' + esc(offs.map(o => o.model).join(', ')) + '">手动关 ' + offs.length + ' 个模型</div>'
+      : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
@@ -458,7 +462,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + (s.api_key ? ' <span class="realm-tag">API Key</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + rateLimits + '</td>' +
+      '<td>' + tag + note + rateLimits + offBadge + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -476,6 +480,7 @@ function renderAccounts(list) {
         ((s.enterprise || s.api_key) ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : (s.api_key ? ' title="刷新 API Key 账号额度（上游 get-enterprise-user-usage）"' : '')) + '>' + ((s.enterprise || s.api_key) ? '额度' : '余额') + '</button>' +
+        '<button class="xs ghost" data-a="models" data-u="' + esc(s.uid) + '" title="手动关闭/开启该账号的模型（手动优先，自动恢复不会重新打开）">模型</button>' +
         ((s.enterprise || s.api_key) ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         // 单号旅行（issue #227）：仅 CN 个人账号有成长体系；global 无任务体系。
@@ -557,6 +562,25 @@ async function loadOverview(quiet) {
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
+// editModelOff 手动开关某账号的模型：当前关闭项以逗号列表编辑，保存时按差集
+// 调 model_off / model_on。手动关闭优先，自动恢复不会重新打开。
+async function editModelOff(u) {
+  const s = (overviewData.accounts || []).find(x => x.uid === u) || {};
+  const cur = (s.model_off || []).map(x => x.model);
+  const raw = prompt('手动关闭的模型（逗号分隔，裸名；清空并确定 = 全部开启）\n当前：' + (cur.length ? cur.join(', ') : '无'), cur.join(', '));
+  if (raw === null) return;
+  const next = Array.from(new Set(raw.split(/[,，\s]+/).map(x => x.trim()).filter(Boolean)));
+  const add = next.filter(m => !cur.includes(m));
+  const del = cur.filter(m => !next.includes(m));
+  for (const m of add) {
+    await api('accounts/' + encodeURIComponent(u) + '/model_off', { method: 'POST', body: JSON.stringify({ model: m }) });
+  }
+  for (const m of del) {
+    await api('accounts/' + encodeURIComponent(u) + '/model_on', { method: 'POST', body: JSON.stringify({ model: m }) });
+  }
+  toast(add.length || del.length ? '模型开关已更新：手动关闭 ' + next.length + ' 个' : '未变更', 'ok');
+}
+
 $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
@@ -583,6 +607,8 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'resume') {
       await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
       toast('已恢复选号', 'ok');
+    } else if (a === 'models') {
+      await editModelOff(u);
     } else if (a === 'travel') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/travel', { method: 'POST' });
       if (r.ok) toast('旅行巡检已执行，结果见运行日志', 'ok');

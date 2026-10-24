@@ -138,6 +138,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 		} else {
 			e.credits = remain
 			e.creditsTotal = total
+			e.creditsKnown = true
 		}
 		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
 		// 重新写入，不能沿用旧窗口/旧批次的缓存。
@@ -551,6 +552,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		APIKey:                   e.a.IsAPIKey(),
 		Nickname:                 e.a.Nickname,
 		Credits:                  e.credits,
+		CreditsKnown:             e.creditsKnown,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
@@ -568,6 +570,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Until:                    e.until,
 		SoftStreak:               e.softStreak,
 		ModelCosts:               p.modelCostsStatusLocked(e, now),
+		ModelOff:                 modelOffEntries(e.modelOff),
 		ConsecutiveFails:         e.consecutiveFails,
 		SessionDeadFails:         e.sessionDeadFails,
 		DegradeUntil:             e.degradeUntil,

@@ -363,6 +363,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_keys[].rpm_limit` | `0` | **每分钟请求数上限**（滑动 60 秒窗口，含 chat / messages / responses 与出图）：超限返回 429 `rate_limit_exceeded` + `Retry-After`（窗口腾出的秒数），不选号、不打上游；`0` = 不限制。只统计通过准入的客户端请求，被拒请求不消耗日请求数；窗口在内存中维护，重启清零 |
 | `api_keys[].max_concurrency` | `0` | **同时在途请求上限**（流式请求到最后一帧才算结束，含出图）：超限返回 429 `rate_limit_exceeded` + `Retry-After: 1`；`0` = 不限制。建议所有密钥的并发上限之和不超过账号数，避免互相抢号 |
 | `models.hidden` | `[]` | **全局模型黑名单**：裸名（`glm-5.2`）对 cn/global 两个域都隐藏，`cn:` / `global:` 前缀只隐藏该域。`GET /v1/models` 不列、chat / 出图点名调用直接 400 `model_unavailable`（知道名字也调不到）；保存后热生效 |
+| `models.aliases` | `[]` | **模型映射**（`["claude-opus-4=glm-5.2"]`）：键大小写不敏感，裸名键两域生效，`cn:` / `global:` 前缀键只在该域生效，值可带前缀跨域指向。映射在黑名单检查**之前**完成（别名不能绕过 `models.hidden`）；出站/选号/粘性/账本用真实名，响应 `model` 回显客户端原发名；保存后热生效 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
@@ -403,6 +404,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `cn.chat_base` | 空 | 国内版上游 base 覆盖（空 = 内置默认 `https://www.codebuddy.cn`）。CN 端点变更/不可达时的逃生门；改动需重启 |
 | `upstream.dump_dir` | 空 | 上游原始报文旁路落盘目录（诊断用，空 = 关闭；也可用 `WB2A_DUMP_UPSTREAM`）。每次 chat 请求落一个文件：出站请求体 + 上游原始 SSE 字节，单文件封顶 8MB，写盘失败不影响请求。**正文含用户提示词**，仅在排障时临时开启；改动需重启 |
 | `upstream.dump_request_max` | `0` | 单个 dump 文件的请求体片段上限（字节），`0` = 默认 256 KiB。长会话的 tools 常排在几百条 messages 之后，可调大 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
@@ -416,6 +418,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与上限钳制 |
 | `pool.cost_explore_interval` | `30m` | costTier 条件探索窗口：免费层垄断且存在未知号时，每窗口把一个真实请求搭车改道给未知号（零新增上游请求；成功即毕业，失败走既有错误策略）。`0` = 关停 |
 | `pool.credit_floor` | `100` | **积分保底**：账号余额低于该值时，对**实测收费**模型（tier 2，账本 6h 内有效观测）不再参与选号——防止收费模型把余额打穿、连免费模型都 402 冷却到次日签到（最坏约 11.5 小时不可用）。tier 0（实测免费）/ tier 1（无观测）**不受限**：保底保的是「留余额给免费模型用」，且 tier 1 若拦会让账本过期 / 重启清零的触底号死锁在「学不回来」。含会话粘性路径（粘性号触底则解绑换号）。全池触底且全 tier 2 时选号返回空（网关回 503），**不放行**。签到回血越过 floor 即刻自动恢复。`0` = 关闭 |
+| `pool.reserve_credits` | `0` | **保留积分硬保底**：余额**已知**且 ≤ 该值时，该账号停止接单（**所有模型，含免费模型**），避免余额被用到 0；仍在池中照常签到 / 旅行 / 刷新余额，充值或签到回血后自动恢复。与 `credit_floor` 的区别：后者只拦收费模型，本项是硬闸。余额从未查询过的账号不受影响。`0` = 关闭（推荐先保持 0，确认效果后再设 10~50） |
 | `pool.model_fallback` | 空 | **模型级降级**：裸模型名 → 等价模型名。上游 6004 / 14003（模型级限流）时，同账号自动换到映射模型重试一次，不再直接失败；冷却仍记在原模型名下。映射值为空或自指会被忽略 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `pool.breaker_cooldown` | `30m` | 熔断基础退避时长 |
@@ -581,6 +584,15 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 - **唯一跳过的是夜猫子**：`RunNightChats` 逐条发真实 glm-5.2 对话，是任务体系中唯一「整任务都是模型对话」的，与「让位防风控」正面冲突。
 
 这正是「一次只放开一个号、其余让位」轮换用法想要的粒度：让位的号不再承接**选号流量**，也避开夜间的对话补足；其余养号动作照常。与「禁用」的区别：禁用是终态（session/授权判死，需人工解冻，保号默认也停），暂停是运维临时态（账号健康，随时恢复）。状态持久化（state.json `paused` 字段），跨重启不丢；`disable`/`revive` 会一并清掉 `paused`。
+
+#### 手动模型开关（账号 × 模型）
+
+面板账号行的「**模型**」按钮：按逗号列表编辑该账号手动关闭的模型（裸名，可带 `cn:` / `global:` 前缀输入，落盘按裸名）。
+
+- **只关单模型**：比「暂停选号」更细，账号本身照常服务其他模型；
+- **手动优先**：手动关闭的组合不会被任何自动恢复重新打开，必须手动删除；与 6004 / 11102 的自动冷却正交；
+- 持久化在 `state.json` 的 `model_off` 字段（稀疏存储，只存关闭项），跨重启不丢；
+- 面板账号状态列显示「手动关 N 个模型」，悬停可看具体模型。
 
 #### 企业版账号（自动识别，无需配置）
 

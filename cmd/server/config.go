@@ -204,7 +204,17 @@ type Config struct {
 		// chat / 出图点名调用直接 400（只藏列表不够——知道名字仍可硬调）。
 		// 面板保存后经 livecfg 热生效，无需重启。
 		Hidden []string `json:"hidden"`
+		// Aliases 模型映射（"客户端名=真实名"）：键大小写不敏感，裸名键两域生效，
+		// "cn:x"/"global:x" 前缀键只在该域生效；值可带前缀跨域指向。映射在黑名单
+		// 检查之前完成（别名不能绕过 models.hidden）；响应 model 回显客户端原发名。
+		Aliases []string `json:"aliases"`
 	} `json:"models"`
+
+	CN struct {
+		// ChatBase 国内版上游 base 覆盖；空 = 内置默认 https://www.codebuddy.cn。
+		// 逃生门：CN 端点变更/不可达时可切备用地址，改动需重启。
+		ChatBase string `json:"chat_base"`
+	} `json:"cn"`
 
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
@@ -323,6 +333,9 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// ReserveCredits 保留积分阈值（0 = 关闭）：余额**已知**且 <= 阈值时该账号
+		// 停止接单（所有模型，含免费），避免余额被用到 0；仍照常签到/旅行，充值恢复。
+		ReserveCredits int64 `json:"reserve_credits"`
 		// ModelFallback 模型降级路由表：key = 客户端请求的模型（裸名），
 		// value = 该模型被 6004 模型级限流时改用的等价模型。
 		// 例：{"deepseek-v4.1-flash": "deepseek-v4-flash"}。
@@ -664,6 +677,9 @@ func (c *Config) normalize() error {
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
 	}
+	if c.Pool.ReserveCredits < 0 {
+		c.Pool.ReserveCredits = 0
+	}
 	// 模型降级表：去空白、丢弃空值/自指条目（自指会让降级判断误以为配置了目标）。
 	if len(c.Pool.ModelFallback) > 0 {
 		cleaned := make(map[string]string, len(c.Pool.ModelFallback))
@@ -773,6 +789,8 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.Models.Hidden = normalizeHiddenModels(c.Models.Hidden)
+	c.Models.Aliases = normalizeHiddenModels(c.Models.Aliases)
+	c.CN.ChatBase = strings.TrimRight(strings.TrimSpace(c.CN.ChatBase), "/")
 	if err := c.normalizeFeatures(); err != nil {
 		return err
 	}

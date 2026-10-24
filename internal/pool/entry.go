@@ -61,10 +61,12 @@ type TokenUsageDelta struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID          string `json:"uid"`
-	Nickname     string `json:"nickname,omitempty"`
-	Credits      int64  `json:"credits"`
-	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	// CreditsKnown 余额是否被上游查询确认过（pool.reserve_credits 只对已知余额生效）。
+	CreditsKnown bool  `json:"credits_known,omitempty"`
+	CreditsTotal int64 `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
 	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
 	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
@@ -112,6 +114,7 @@ type Status struct {
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
 	// samples）；无观测/全部过期 → nil（tier 1 未知层）。
 	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
+	ModelOff   []ModelOffEntry   `json:"model_off,omitempty"`
 	// ConsecutiveFails 连续失败计数（连败降权用，见 entry.consecutiveFails）。
 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
@@ -192,7 +195,10 @@ type modelCostEntry struct {
 type entry struct {
 	a            *auth.Auth
 	credits      int64
+	creditsKnown bool  // 余额是否被上游查询确认过（reserve_credits 只对已知余额生效）
 	creditsTotal int64 // 积分总额度（UserResource 聚合；0 = 未知）
+	// modelOff 运维手动关闭的 (账号, 模型) 组合（稀疏，仅存关闭项；见 toggle.go）。
+	modelOff map[string]modelOff
 	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。
 	// creditsEarliestExpiry / creditsEarliestRemaining 是全部未来到期批次中的最早一批；
 	// 两者均由签到/余额刷新更新，供 earliest-expiry 路由和状态观测使用。
@@ -344,6 +350,10 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	if e.disabled || e.paused {
 		return false
 	}
+	if e.modelOffed(reqModel) {
+		// 运维手动关闭：手动优先，自动恢复也不能打开。
+		return false
+	}
 	if e.modelCooled(now, reqModel) {
 		// 该模型在 6004 独立冷却中 → 不可选。
 		return false
@@ -428,8 +438,10 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
-	CreditsTotal int64     `json:"credits_total,omitempty"`
+	Credits      int64 `json:"credits"`
+	CreditsTotal int64 `json:"credits_total,omitempty"`
+	// CreditsKnown 余额是否被上游查询确认过（reserve_credits 只对已知余额生效）。
+	CreditsKnown bool      `json:"credits_known,omitempty"`
 	Disabled     bool      `json:"disabled"`
 	Paused       bool      `json:"paused,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
@@ -478,6 +490,9 @@ type stateAccount struct {
 	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。
 	// 恢复时惰性过滤已过期条目。
 	ModelCooldowns map[string]stateModelCooldown `json:"model_cooldowns,omitempty"`
+	// ModelOffness 运维手动关闭的 (账号, 模型) 组合（稀疏，仅存关闭项）。
+	// 与自动冷却正交：手动关闭永久生效，只有手动开启能解除。
+	ModelOff map[string]modelOff `json:"model_off,omitempty"`
 	// ModelCosts 实测扣费账本（model → 单价观测，见 entry.modelCost）。持久化
 	// （P1-anti-monopoly）：重启后成本知识保留，限免/夜间免费的跨重启窗口不再
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——

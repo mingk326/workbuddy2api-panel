@@ -30,6 +30,9 @@ type Snapshot struct {
 	// HiddenModels 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；
 	// nil = 不隐藏。models.hidden 热生效：面板保存后下一请求即应用。
 	HiddenModels map[string]struct{}
+	// ModelAliases 客户端模型名 → 真实模型名（键已归一化为小写 "cn:x"/"global:x"）；
+	// nil = 不映射。models.aliases，issue #30。
+	ModelAliases map[string]string
 
 	// 积分闸（0 = 关闭对应闸）。面板保存配置后下一请求生效，无需重启。
 	BudgetDailyCreditLimit float64 // 当日累计 credit 上限
@@ -96,7 +99,48 @@ func (h *Holder) Store(s Snapshot) {
 		}
 		s.HiddenModels = m
 	}
+	if len(s.ModelAliases) > 0 {
+		m := make(map[string]string, len(s.ModelAliases))
+		for k, v := range s.ModelAliases {
+			m[k] = v
+		}
+		s.ModelAliases = m
+	}
 	h.p.Store(&s)
+}
+
+// NormalizeModelAliases 把 models.aliases 条目（"客户端名=真实名"）归一化为查找表。
+//
+//   - 按第一个 "=" 拆键值；键/值都 Trim，键小写存储（查找端同样小写）。
+//   - 键带合法 realm 前缀 → 只在该域生效；裸名键同时登记 cn/global 两域。
+//   - 值原样保留（可带 realm 前缀实现跨域指向）。
+//   - 无 "="、空键、空值、键==值（大小写不敏感）→ 丢弃。
+func NormalizeModelAliases(in []string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in)*2)
+	for _, item := range in {
+		k, v, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+		if k == "" || v == "" || strings.EqualFold(k, v) {
+			continue
+		}
+		if prefix, bare, ok := strings.Cut(k, ":"); ok && (prefix == "cn" || prefix == "global") && bare != "" {
+			out[prefix+":"+bare] = v
+		} else {
+			out["cn:"+k] = v
+			out["global:"+k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // NormalizeHiddenModels 把用户配置的 models.hidden 条目归一化为精确 id 集合。

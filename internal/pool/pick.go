@@ -264,6 +264,11 @@ func (p *Pool) floorBlockedForModel(e *entry, model string, now time.Time) bool 
 // floorBlockedForRealmModel 同上，但带 realm 上下文（倍率按 (realm, 模型) 分桶，
 // 同名模型在 CN / global 两域倍率可不同）。realm 为空时按倍率表的空域键查。
 func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time.Time) bool {
+	// 保留积分（pool.reserve_credits）：余额已知且 <= 阈值 → 所有模型都停止接单。
+	// 与 credit_floor 的区别：后者只拦收费模型，本闸是硬保底（含免费模型）。
+	if p.reserveCredits > 0 && e.creditsKnown && e.credits <= p.reserveCredits {
+		return true
+	}
 	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
 		return false
 	}

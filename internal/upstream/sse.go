@@ -548,6 +548,7 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	modelEcho    string
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -567,6 +568,12 @@ func WithMarkupRepair(r *MarkupRepair) StreamOption {
 // 第一帧之前就把账号记成功，限流号被当成健康号；有观察者后可在流尾按帧分类处置。
 func WithErrorFrameObserver(fn func(payload string)) StreamOption {
 	return func(o *streamOptions) { o.onErrorFrame = fn }
+}
+
+// WithModelEcho 把透传帧的顶层 model 覆写回客户端原发名（models.aliases 命中时）。
+// echo 为空 → 零改写，与未接线完全一致。
+func WithModelEcho(echo string) StreamOption {
+	return func(o *streamOptions) { o.modelEcho = echo }
 }
 
 // StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
@@ -635,6 +642,11 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// 已用过的最大 tool_call index（供标记修复接续编号）。
 	// fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
 	writeChunk := func(obj map[string]any, fallback string) error {
+		// 模型名回显（models.aliases）：客户端请求名与真实模型不同时，响应保持原发名，
+		// 严格校验「响应 model == 请求 model」的客户端不会报错。
+		if o.modelEcho != "" {
+			obj["model"] = o.modelEcho
+		}
 		// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
 		stripToolCallNames(obj, toolCallSeen)
 		// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，

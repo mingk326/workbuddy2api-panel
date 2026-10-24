@@ -88,6 +88,7 @@ func (p *Pool) resumeLocked(e *entry) {
 func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
 	e.credits = credits
 	e.creditsTotal = total
+	e.creditsKnown = true
 	if e.coolKind == CoolHard {
 		e.until = time.Time{}
 		e.coolKind = 0
