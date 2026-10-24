@@ -1,32 +1,50 @@
 /* 移动端 A 方案：桌面端不显示任何新增壳层元素。 */
-.mobile-nav, .mobile-add, .mobile-detail, .mobile-more-view { display: none; }
+.mobile-nav, .mobile-detail, .mobile-more-view { display: none; }
 
 @media (max-width: 760px) {
-  html, body { max-width: 100%; overflow-x: hidden; }
+  /* 只在 html 上裁横向溢出：若给 body 也加 overflow-x，body 会变成独立滚动容器，
+     页面纵向滚动与 window.scrollTo 都会失效（整页停在首屏）。 */
+  html { overflow-x: hidden; }
+  html, body { max-width: 100%; }
   body { font-size: 15px; }
   .shell { display: block; min-height: 100svh; }
   .nav { display: none; }
   .main { display: block; }
   .topbar { min-height: 58px; padding: 10px 16px; gap: 10px; }
   .topbar h2 { font-size: 17px; }
-  .topbar .sep, .topbar .meta, .topbar #btnTheme, .topbar #btnAdd { display: none; }
-  .topbar #btnRefresh { min-width: 52px; min-height: 40px; }
+  .topbar .sep, .topbar .meta, .topbar #btnTheme { display: none; }
+  .topbar #btnRefresh { min-height: 40px; padding: 7px 12px; }
+  .topbar #btnAdd { display: none; min-height: 40px; padding: 7px 12px; }
+  body.mobile-accounts .topbar #btnAdd { display: inline-flex; }
   .view { max-width: 680px; padding: 16px 14px 100px; }
   .box { margin-bottom: 16px; border-radius: 12px; }
-  .box > header { flex-wrap: wrap; gap: 8px; padding: 12px 14px; }
-  .box > header h3 { font-size: 14px; white-space: normal; }
-  .box > header h3 .hint { display: block; margin: 3px 0 0; line-height: 1.5; }
+  /* 标题独占一行，说明与操作另起一行：长说明在窄屏不会被挤成逐字换行。 */
+  .box > header { flex-wrap: wrap; gap: 8px 10px; padding: 12px 14px; align-items: center; }
+  .box > header > h3 { flex: 1 1 100%; font-size: 14px; line-height: 1.45; white-space: normal; }
+  .box > header > h3 .hint { display: block; margin: 3px 0 0; line-height: 1.55; }
+  .box > header > .grow { display: none; }
+  .box > header > .note { flex: 1 1 100%; text-align: left; white-space: normal; }
   .box .pad { padding: 14px; }
-  .hint { overflow-wrap: anywhere; }
+  .hint { overflow-wrap: break-word; }
   button { min-height: 40px; }
   button.xs { min-height: 34px; padding: 6px 10px; }
   input, select { min-height: 42px; font-size: 16px; }
   .tbl-wrap { -webkit-overflow-scrolling: touch; }
-  .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 16px; }
-  .stat { padding: 13px 12px; }
-  .stat .v { font-size: 22px; overflow-wrap: anywhere; white-space: normal; }
-  .stat:nth-child(5), .stat:nth-child(6), .stat:nth-child(7) { grid-column: span 1; }
-  .stat .k { font-size: 10.5px; }
+  /* 宽表（模型锁池 / 模型 / 密钥 / 用量 / 请求记录）在窄屏靠横向滚动查看。
+     表格自动布局会把中文压成每行一两个字，这里统一不换行并给列留下限宽。 */
+  .tbl-wrap .acc th, .tbl-wrap .acc td { white-space: nowrap; }
+  .tbl-wrap .acc th { min-width: 4.5em; }
+  .acc.lock { min-width: 860px; }
+  .acc.lock th:last-child, .acc.lock td:last-child { white-space: normal; min-width: 200px; }
+  #accBody .who .nm, #accBody .who .id,
+  #accBody tr[data-account-uid] td:nth-child(3) > .hint,
+  #accBody .rate-limit span { white-space: normal; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 16px; }
+  .stat { padding: 12px 13px; }
+  .stat .v { font-size: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 「积分剩余 / 总额」天然比其他计数长：放到最后一整行，不挤成两截。 */
+  .stat:nth-child(6) { grid-column: 1 / -1; order: 1; }
+  .stat .k { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .kpis, .kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px 12px 2px; gap: 8px; }
   .kpi { padding: 10px 10px 11px 13px; }
   .kpi .v { font-size: 20px; }
@@ -41,9 +59,10 @@
   .fbar .trange { width: 100%; }
   .trange .tr-custom { flex-wrap: wrap; }
   .trange input { min-width: 0; max-width: 100%; }
-  .exp-row { flex-wrap: wrap; }
-  .exp-nm { min-width: 0; }
-  .exp-main { flex: 1 1 200px; }
+  .exp-row { display: grid; grid-template-columns: 9px minmax(0, 1fr); gap: 2px 9px; align-items: start; }
+  .exp-dot { grid-row: 1 / span 2; margin-top: 5px; }
+  .exp-nm, .exp-main { grid-column: 2; min-width: 0; }
+  .exp-row .note { overflow-wrap: break-word; }
   .qprog { padding: 12px 14px 0; }
   .qrow { grid-template-columns: minmax(0, 1fr) auto; gap: 5px 10px; padding: 11px 14px; }
   .qrow .code { grid-column: 1; grid-row: 1; }
@@ -54,10 +73,10 @@
   .shead { display: none; }
   .srow { grid-template-columns: 1fr; gap: 10px; padding: 14px; }
   .stasks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .savebar { bottom: 67px; flex-wrap: wrap; z-index: 10; }
+  .savebar { bottom: calc(67px + env(safe-area-inset-bottom)); flex-wrap: wrap; z-index: 10; }
   .savebar .grow, .savebar .restart-note { display: none; }
   .savebar button { flex: 1; }
-  #logBox { font-size: 11px; padding: 12px; }
+  #logBox { font-size: 11px; padding: 12px; word-break: normal; overflow-wrap: anywhere; }
   #reqSummary, #reqNote { flex: 1 1 100%; text-align: left; white-space: normal; }
   .pk-card { flex-basis: 100%; min-width: 0; }
   .pk-card .who { flex-wrap: wrap; }
@@ -65,52 +84,60 @@
   .vc .ft { flex-wrap: wrap; }
   .vc .ft code { max-width: 100%; overflow-wrap: anywhere; }
 
-  /* 账号表只在窄屏变为摘要卡片；桌面表格和按钮保持原样。 */
+  /* 账号表只在窄屏变为摘要卡片；桌面表格和按钮保持原样。
+     卡片用 grid 两行布局，未使用 float/伪元素环绕，避免窄屏文字错位串行。 */
   #view-accounts > .box:has(#accBody) .tbl-wrap { overflow: visible; }
-  #accBody, #accBody tr, #accBody td { display: block; }
-  #accBody { padding: 8px; }
   #view-accounts > .box:has(#accBody) thead { display: none; }
   #view-accounts > .box:has(#accBody) table { min-width: 0; }
+  #accBody { display: block; padding: 8px; }
   #accBody tr[data-account-uid] {
-    position: relative; display: grid;
+    display: grid;
     grid-template-columns: 3px minmax(0, 1fr) auto;
-    grid-template-areas: "mark who cred" "mark state state";
-    gap: 9px 12px; align-items: center;
-    min-height: 104px; padding: 15px 14px; margin-bottom: 8px;
+    grid-template-areas: "mark who cred" "mark state cred";
+    column-gap: 12px; row-gap: 7px; align-items: start;
+    padding: 14px; margin-bottom: 8px;
     background: var(--surface-2); border: 1px solid var(--line-soft);
     border-radius: 11px; cursor: pointer; -webkit-tap-highlight-color: transparent;
   }
   #accBody tr[data-account-uid]:last-child { margin-bottom: 0; }
   #accBody tr[data-account-uid]:active { border-color: var(--accent); }
   #accBody tr[data-account-uid] td {
-    padding: 0; border: 0; width: auto; min-width: 0; max-width: none;
+    display: block; padding: 0; border: 0;
+    width: auto; min-width: 0; max-width: none;
   }
   #accBody tr[data-account-uid] td.mark { grid-area: mark; align-self: stretch; width: 3px; min-width: 3px; }
-  #accBody tr[data-account-uid] td.mark i { height: 100%; min-height: 66px; border-radius: 2px; }
-  #accBody tr[data-account-uid] td.who { grid-area: who; min-width: 0; max-width: none; }
-  #accBody tr[data-account-uid] td.who::before {
-    content: ''; float: left; width: 38px; height: 38px; margin-right: 10px;
-    background: var(--accent-soft); border-radius: 10px;
-  }
-  #accBody .who .nm { margin-left: 48px; font-size: 15px; line-height: 22px; white-space: normal; }
-  #accBody .who .id { margin-left: 48px; font-size: 10.5px; line-height: 16px; }
-  #accBody .realm-tag { margin-left: 4px; }
+  #accBody tr[data-account-uid] td.mark i { display: block; height: 100%; min-height: 56px; border-radius: 2px; }
+  #accBody tr[data-account-uid] td.who { grid-area: who; }
+  #accBody .who .nm { font-size: 15px; line-height: 1.4; white-space: normal; overflow-wrap: break-word; }
+  #accBody .who .id { font-size: 10.5px; line-height: 1.5; overflow-wrap: break-word; }
+  #accBody .realm-tag { margin-left: 4px; white-space: nowrap; }
   #accBody tr[data-account-uid] td:nth-child(3) {
-    grid-area: state; padding-left: 48px; min-width: 0;
+    grid-area: state; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 7px;
+    min-width: 0;
   }
   #accBody tr[data-account-uid] td:nth-child(3)::after {
-    content: '查看详情 ›'; float: right; margin-left: 8px;
-    color: var(--ink-3); font-size: 11px; white-space: nowrap;
+    content: '›'; margin-left: auto; color: var(--ink-3);
+    font-size: 17px; line-height: 1; white-space: nowrap;
   }
-  #accBody tr[data-account-uid] td:nth-child(3) .hint { font-size: 11px !important; }
-  #accBody tr[data-account-uid] td.cred { grid-area: cred; min-width: 82px; text-align: right; }
-  #accBody .cred .n { font-size: 17px; }
-  #accBody .cred .n::after { content: '剩余积分'; display: block; margin-top: 3px; font: 10px var(--sans); color: var(--ink-3); }
+  #accBody tr[data-account-uid] td:nth-child(3) > .hint,
+  #accBody tr[data-account-uid] td:nth-child(3) > .rate-limits { flex: 1 1 100%; margin: 0; min-width: 0; }
+  #accBody tr[data-account-uid] td:nth-child(3) > .hint { font-size: 11px !important; line-height: 1.5; }
+  #accBody tr[data-account-uid] td.cred { grid-area: cred; align-self: center; min-width: 84px; text-align: right; }
+  #accBody .cred .n { font-size: 17px; line-height: 1.25; white-space: nowrap; }
+  #accBody .cred .n .of { display: block; margin-top: 2px; font-size: 10.5px; color: var(--ink-3); }
   #accBody .cred .bar { margin-left: auto; max-width: 100px; }
   #accBody tr[data-account-uid] td:nth-child(n+5) { display: none; }
-  #accBody .rate-limits { min-width: 0; }
-  #accBody .rate-limit { flex-wrap: wrap; }
-  #accBody > tr:not([data-account-uid]) > td { padding: 20px; }
+  #accBody .rate-limits { display: flex; flex-direction: column; gap: 4px; }
+  #accBody .rate-limit { flex-wrap: wrap; min-width: 0; }
+  #accBody > tr:not([data-account-uid]) { display: block; }
+  #accBody > tr:not([data-account-uid]) > td { display: block; padding: 20px; }
+
+  /* 首页顺序：账号池优先，到期提醒与模型锁池随后（A 方案的「账号先行」）。 */
+  #view-accounts:not([hidden]) { display: flex; flex-direction: column; }
+  #view-accounts > .stats { order: 0; }
+  #view-accounts > #accBox { order: 1; }
+  #view-accounts > #expBox { order: 2; }
+  #view-accounts > #accBox + .box, #view-accounts > .box:last-of-type { order: 3; }
 
   .mobile-nav {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
@@ -127,17 +154,6 @@
   }
   .mobile-nav button span { font: 20px/20px var(--mono); }
   .mobile-nav button.on { color: var(--accent); background: var(--accent-soft); }
-  body.mobile-add-visible:not(.mobile-detail-open) .mobile-add {
-    position: fixed; right: max(16px, calc((100vw - 680px) / 2 + 16px));
-    bottom: calc(80px + env(safe-area-inset-bottom)); z-index: 39;
-    display: grid; place-items: center; width: 48px; height: 48px; min-height: 48px;
-    padding: 0 0 3px; border: 0; border-radius: 15px;
-    background: var(--accent); color: var(--accent-ink);
-    box-shadow: 0 6px 18px var(--accent-soft), 0 4px 12px rgba(0,0,0,.25);
-    font-size: 30px; font-weight: 300;
-  }
-  body:not(.mobile-add-visible) .mobile-add, body.mobile-detail-open .mobile-add { display: none; }
-  body:has(.view:not([hidden]):not(#view-accounts)) .mobile-add { display: none; }
   .mobile-more-view:not([hidden]) { display: block; }
   .mobile-more-list { padding: 6px; }
   .mobile-more-list > button {
@@ -171,20 +187,21 @@
     background: var(--accent-soft); color: var(--accent); border-radius: 14px;
     font-size: 20px; font-weight: 650;
   }
-  .mobile-account-hero h2 { font-size: 20px; overflow-wrap: anywhere; }
-  .mobile-uid { margin: 6px 0 12px; color: var(--ink-3); font: 11px var(--mono); overflow-wrap: anywhere; }
-  .mobile-credit { margin-top: 19px; font: 600 32px/1.1 var(--mono); }
+  .mobile-account-hero h2 { font-size: 20px; overflow-wrap: break-word; }
+  .mobile-uid { margin: 6px 0 12px; color: var(--ink-3); font: 11px var(--mono); overflow-wrap: break-word; word-break: break-all; }
+  .mobile-credit { margin-top: 19px; font: 600 clamp(24px, 8vw, 32px)/1.1 var(--mono); overflow-wrap: break-word; }
   .mobile-credit small { display: block; margin-top: 6px; color: var(--ink-3); font: 11px var(--sans); }
   .mobile-facts {
     margin-top: 14px; padding: 0 14px; background: var(--surface);
     border: 1px solid var(--line); border-radius: 12px;
   }
-  .mobile-facts > div { display: flex; justify-content: space-between; gap: 12px; padding: 13px 0; }
+  .mobile-facts > div { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 13px 0; }
   .mobile-facts > div + div { border-top: 1px solid var(--line-soft); }
-  .mobile-facts span { color: var(--ink-3); font-size: 12px; }
-  .mobile-facts b { text-align: right; font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+  .mobile-facts span { flex: none; color: var(--ink-3); font-size: 12px; }
+  .mobile-facts b { max-width: 64%; text-align: right; font-size: 13px; font-weight: 500; overflow-wrap: break-word; }
   .mobile-account-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 18px; }
-  .mobile-account-actions button { min-height: 46px; padding: 10px 6px; }
+  .mobile-account-actions button { min-height: 46px; padding: 10px 6px; white-space: nowrap; }
+  .mobile-account-actions button.danger { background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 28%, var(--line)); }
   body.mobile-detail-open { overflow: hidden; }
   body.mobile-detail-open #mobileNav { display: none; }
   body.mobile-detail-open .veil.on { z-index: 60; }
@@ -198,21 +215,22 @@
   .dlg .tabs { display: flex; margin: 12px 0 0; }
   .dlg .tabs .tab { flex: 1; min-height: 38px; }
   .tab-panel + .tab-panel { margin: 0 -16px; padding: 14px 16px 0; }
-  #toasts { left: 14px; right: 14px; bottom: calc(82px + env(safe-area-inset-bottom)); align-items: stretch; }
+  /* Toast 固定在顶部 topbar 下方：底部已有导航与悬浮按钮，不再互相遮挡。 */
+  #toasts { top: calc(64px + env(safe-area-inset-top)); bottom: auto; left: 14px; right: 14px; align-items: stretch; }
   .tst { max-width: none; }
-  body.mobile-detail-open #toasts { bottom: 18px; }
 }
 
 @media (max-width: 420px) {
   .view { padding-left: 12px; padding-right: 12px; }
-  .stat { padding: 12px 9px; }
-  .stat .v { font-size: 20px; }
+  .stat { padding: 11px 10px; }
+  .stat .v { font-size: 18px; }
   #accBody { padding: 6px; }
-  #accBody tr[data-account-uid] { padding: 13px 11px; gap: 8px 10px; }
-  #accBody tr[data-account-uid] td.cred { min-width: 74px; }
+  #accBody tr[data-account-uid] { padding: 12px 11px; column-gap: 10px; row-gap: 6px; }
+  #accBody tr[data-account-uid] td.cred { min-width: 76px; }
   #accBody .cred .n { font-size: 15px; }
+  .box > header > button { flex: 1 1 calc(50% - 5px); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .mobile-nav, .mobile-add, .mobile-detail { transition: none; }
+  .mobile-nav, .mobile-detail { transition: none; }
 }

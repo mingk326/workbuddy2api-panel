@@ -78,7 +78,7 @@ const MobilePanel = (() => {
     const current = view === 'more' ? 'more' : view;
     document.querySelectorAll('#mobileNav [data-view]').forEach(b => b.classList.toggle('on', b.dataset.view === current));
     document.body.classList.toggle('mobile-more', view === 'more');
-    document.body.classList.toggle('mobile-add-visible', view === 'accounts');
+    document.body.classList.toggle('mobile-accounts', view === 'accounts');
     document.body.classList.toggle('mobile-detail-open', !!uid);
   }
   function open(uidValue) {
@@ -114,7 +114,6 @@ const MobilePanel = (() => {
         history.replaceState(null, '', '#' + b.dataset.view);
       }
     }));
-    $('mobileAdd').addEventListener('click', () => $('btnAdd').click());
     $('mobileDetailBack').addEventListener('click', close);
     $('mobileDetailClose').addEventListener('click', close);
     document.addEventListener('keydown', e => { if (e.key === 'Escape' && uid) close(); });
