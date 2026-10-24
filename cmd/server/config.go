@@ -198,6 +198,14 @@ type Config struct {
 		AccountSpreadMinGapSeconds int `json:"account_spread_min_gap_seconds"`
 	} `json:"schedule"`
 
+	Models struct {
+		// Hidden 不对外暴露的模型黑名单。裸名 = cn/global 两域都隐藏；
+		// "cn:xxx"/"global:xxx" = 只隐藏该域。生效点：/v1/models 列表过滤、
+		// chat / 出图点名调用直接 400（只藏列表不够——知道名字仍可硬调）。
+		// 面板保存后经 livecfg 热生效，无需重启。
+		Hidden []string `json:"hidden"`
+	} `json:"models"`
+
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
 		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
@@ -764,6 +772,7 @@ func (c *Config) normalize() error {
 	if err := c.normalizeAPIKeys(); err != nil {
 		return err
 	}
+	c.Models.Hidden = normalizeHiddenModels(c.Models.Hidden)
 	if err := c.normalizeFeatures(); err != nil {
 		return err
 	}
@@ -906,6 +915,28 @@ func (c *Config) normalizeAPIKeys() error {
 		return fmt.Errorf("api_keys: 至少需要一把管理员密钥（admin=true），否则管理面板将无法登录")
 	}
 	return nil
+}
+
+// normalizeHiddenModels 归一化 models.hidden：去空白、去空项、去重、保序。
+// 条目形态（裸名 / cn: / global:）原样保留，展开成两域的判定在 livecfg 侧完成。
+func normalizeHiddenModels(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, m := range in {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // EffectiveKeys 把配置转换为运行期密钥表：api_keys 各条 + 旧版 api_key（恒为 admin）。

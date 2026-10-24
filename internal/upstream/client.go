@@ -38,7 +38,7 @@ const (
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrModelBlocked                  // 11102「该后端无此模型」/ 11158「账号类型无权使用」→ (账号,模型) 负缓存避让
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
@@ -276,29 +276,43 @@ func IsModelRateLimit(body string) bool {
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
 const modelBlockCode = "11102"
 
+// modelForbiddenCode 明确指向「该账号类型无权使用该模型」的业务 code。
+// 与 11102 同属 (账号, 模型) 级负缓存：换有权限的账号仍可能成功，全部账号都被
+// 拒绝时才向客户端报模型不可用；reason 分开便于 /status 台账区分原因。
+const modelForbiddenCode = "11158"
+
 // modelBlockMsgMarker 11102 答复的确定性文案（官方 error message 固定短语）。
 // 只收这个窄短语，不收 "model ... not found" 宽正则——后者会误伤其他业务的
 // not found 措辞。
 const modelBlockMsgMarker = "service info not found"
+
+// modelForbiddenMsgMarker 11158 答复的确定性文案。
+const modelForbiddenMsgMarker = "is not allowed for user type"
 
 // ModelBlockReason 11102 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
 // handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11102" 前缀识别条目
 // （与 6004 条目的 "6004 model rate limit" reason 互不干扰）。
 const ModelBlockReason = "11102 model not available"
 
-// IsModelBlocked 报告 body 是否是「该后端无此模型」(11102) 的确定性答复。
+// ModelForbiddenReason 11158 负缓存条目 reason 前缀（与 11102 分开，便于区分原因）。
+const ModelForbiddenReason = "11158 model not allowed for account type"
+
+// IsModelBlocked 报告 body 是否是「该后端无此模型」(11102) 或「账号类型无权使用
+// 该模型」(11158) 的确定性答复。
 //
 // 只比对 code/msg 等独立字段，绝不做整段文本子串匹配：错误体还带 requestId 等字段，
 // 拿整段文本匹配会把 "11102" 撞在 ID 上、误避让一个本来能用的模型。判定 =
-// code 字段精确等于 "11102"，或 msg/message 字段命中窄短语 "service info not
-// found"（两者任一命中即真）。只看 400/404：429 带 11102 属限流语义。
+// code 字段精确等于 "11102"/"11158"，或 msg/message 字段命中对应窄短语。
+// 只看 400/404：429 带这些 code 属限流语义。
 // 字段遍历覆盖顶层与 error 子对象两层。
 func IsModelBlocked(status int, body string) bool {
 	if (status != http.StatusBadRequest && status != http.StatusNotFound) || body == "" {
 		return false
 	}
-	// 轻量预检：body 既无 "11102" 又无 marker 时直接短路（大多数 4xx 零分配返回）。
-	if !strings.Contains(body, modelBlockCode) && !strings.Contains(strings.ToLower(body), modelBlockMsgMarker) {
+	lower := strings.ToLower(body)
+	// 轻量预检：body 既无业务 code 又无 marker 时直接短路（大多数 4xx 零分配返回）。
+	if !strings.Contains(body, modelBlockCode) && !strings.Contains(body, modelForbiddenCode) &&
+		!strings.Contains(lower, modelBlockMsgMarker) && !strings.Contains(lower, modelForbiddenMsgMarker) {
 		return false
 	}
 	var root map[string]any
@@ -322,10 +336,20 @@ func IsModelBlocked(status int, body string) bool {
 			}
 		}
 	}
-	if code == modelBlockCode {
+	if code == modelBlockCode || code == modelForbiddenCode {
 		return true
 	}
-	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
+	lowerMsg := strings.ToLower(msg)
+	return strings.Contains(lowerMsg, modelBlockMsgMarker) || strings.Contains(lowerMsg, modelForbiddenMsgMarker)
+}
+
+// ModelBlockReasonFor 返回确定性模型拒绝对应的负缓存 reason。
+func ModelBlockReasonFor(body string) string {
+	lower := strings.ToLower(body)
+	if strings.Contains(body, modelForbiddenCode) || strings.Contains(lower, modelForbiddenMsgMarker) {
+		return ModelForbiddenReason
+	}
+	return ModelBlockReason
 }
 
 // HasCodeMarker 报告 JSON 错误信封里是否存在精确等于 want 的业务 code（含嵌套

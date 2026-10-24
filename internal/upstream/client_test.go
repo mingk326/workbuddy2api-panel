@@ -78,6 +78,15 @@ func TestClassify(t *testing.T) {
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
 		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
+		// 11158「账号类型无权使用该模型」：与 11102 同归 ErrModelBlocked，
+		// 换有权限的账号仍可能成功；(账号,模型) 负缓存但 reason 分开记录。
+		{400, `{"code":11158,"msg":"model [primary-model] is not allowed for user type [personal]"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11158","message":"model is not allowed for user type"}}`, ErrModelBlocked},
+		{400, `{"msg":"model [x] is not allowed for user type [personal]"}`, ErrModelBlocked},
+		// 11158 撞在 requestId 上不算（不得误避让可用模型）。
+		{404, `{"requestId":"11158","msg":"ok"}`, ErrNotFound},
+		// 429 + 11158 → 限流语义。
+		{429, `{"code":11158,"msg":"is not allowed for user type"}`, ErrSoftRate},
 		// 429 + 余额措辞 → 限流语义（fork-scan-absorb T-3，本次修复点）：限流响应
 		// body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
 		// hardRule 在 429 之前会误判 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。

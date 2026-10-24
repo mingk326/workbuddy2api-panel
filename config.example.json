@@ -22,6 +22,9 @@
       "max_concurrency": 4
     }
   ],
+  "models": {
+    "hidden": []
+  },
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {

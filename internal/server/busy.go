@@ -51,7 +51,7 @@ func (h *Handler) chatBusy(w http.ResponseWriter, r *http.Request) {
 	for _, m := range req.Models {
 		realm, bare := resolveModel(m)
 		lvl := busyLevelUnknown
-		allowed := !hasKey || key.AllowsModel(realm, bare)
+		allowed := (!hasKey || key.AllowsModel(realm, bare)) && !h.hiddenModel(realm, bare)
 		if allowed {
 			if _, ok := known[bare]; ok {
 				if h.cfg.Pool != nil && h.cfg.Pool.ModelBlockedForRealm(bare, realm).Blocked {

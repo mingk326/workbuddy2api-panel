@@ -82,6 +82,13 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 	}
 	defer st.done()
 
+	// 全局模型黑名单（models.hidden）先于密钥白名单：模型对网关不存在。
+	if h.hiddenModel(realm, bare) {
+		st.status = http.StatusBadRequest
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			model+" 已被网关配置隐藏（models.hidden），请换一个模型")
+		return
+	}
 	// 密钥级模型白名单：名单外出图模型直接 403（先于下架/路由检查，
 	// 避免向无权限的密钥泄露模型可用性）。
 	if key, ok := authKeyFrom(r.Context()); ok && !key.AllowsModel(realm, bare) {

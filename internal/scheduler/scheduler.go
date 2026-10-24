@@ -78,6 +78,10 @@ type Config struct {
 	// 的任务奖励领掉，不跑任何行为链路）。与 GrowthHook 同款延迟挂载；nil 时
 	// ticker 到点跳过。见 issue #174：成长队列与「一键完成」都不负责这条补领链路。
 	TaskSweepHook func()
+
+	// RunStampFile 启动补跑去重记录的落盘路径（见 runstamps.go）。空 = 不持久化，
+	// 每次重启都补一轮；配置后同一类任务当天只补一次。
+	RunStampFile string
 }
 
 // Scheduler 调度器。
@@ -88,6 +92,9 @@ type Scheduler struct {
 	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
 	mu         sync.Mutex
 	adoptTried map[string]string
+
+	// stampMu 串行化补跑标记文件的读写（见 runstamps.go）。
+	stampMu sync.Mutex
 
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
 	// rearmSchedule/rearmBalance/rearmSweep 是「排程已变，立即重算」通知：Run 与各周期
@@ -299,11 +306,15 @@ const (
 	taskGrowth
 )
 
-// nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
-// 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
-// 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
-// 排程参数在 schedMu 下快照，与 Reconfigure 的并发写隔离。
-func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+// slot 单个任务的计划触发时刻。
+type slot struct {
+	at   time.Time
+	kind taskKind
+}
+
+// enabledSlots 返回各类任务的下一次触发时点（本地时区整点）。
+// 已显式禁用的任务不进候选。排程参数在 schedMu 下快照，与 Reconfigure 的并发写隔离。
+func (s *Scheduler) enabledSlots(now time.Time) []slot {
 	s.schedMu.Lock()
 	checkinHours, keepaliveHours, blackcatHours := s.cfg.CheckinHours, s.cfg.KeepaliveHours, s.cfg.BlackcatHours
 	travelHours, activityHours := s.cfg.TravelHours, s.cfg.ActivityHours
@@ -312,10 +323,6 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	travelOff, activityOff := s.cfg.TravelDisabled, s.cfg.ActivityDisabled
 	s.schedMu.Unlock()
 
-	type slot struct {
-		at   time.Time
-		kind taskKind
-	}
 	var slots []slot
 	if !checkinOff {
 		slots = append(slots, slot{nextFire(now, checkinHours), taskCheckin})
@@ -335,6 +342,13 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	if !growthOff {
 		slots = append(slots, slot{nextFire(now, growthHours), taskGrowth})
 	}
+	return slots
+}
+
+// nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
+// 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
+func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+	slots := s.enabledSlots(now)
 	var earliest time.Time
 	for _, sl := range slots {
 		if sl.at.IsZero() {
@@ -435,6 +449,17 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 func (s *Scheduler) Run(ctx context.Context) {
 	// 摊开等待读取该 ctx：优雅停机时立即放弃剩余账号，不等睡满窗口。
 	s.setRunCtx(ctx)
+	// 启动补跑：进程停机（部署 / 重启 / 崩溃）跨过今天的时点，迟到唤醒补跑救不了
+	// ——它只管进程活着时 timer 被睡眠冻结。这里补一轮：各任务按天幂等，窗口类
+	// （夜猫子）自带守卫；runstamps 保证同一天重启多次也只补一次。
+	if missed := s.missedToday(time.Now()); len(missed) > 0 {
+		log.Printf("启动补跑：%v（今天的时点已过）", missed)
+		if !sleepCtx(ctx, wakeupGraceDelay) {
+			return // 开机瞬间网络/DNS 可能未就绪（同 issue #152 的宽限口径）
+		}
+		s.runBatch(ctx, missed)
+		s.markRan(missed, time.Now())
+	}
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {

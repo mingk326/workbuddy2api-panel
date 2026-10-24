@@ -33,7 +33,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.15.7-panel"
+const appVersion = "1.15.8-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -210,6 +210,8 @@ func main() {
 		// （0 = 关闭，保持整点齐发现状）。
 		AccountSpreadMinutes:       cfg.Schedule.AccountSpreadMinutes,
 		AccountSpreadMinGapSeconds: cfg.Schedule.AccountSpreadMinGapSeconds,
+		// 启动补跑去重：与 state.json 同目录，重启多次只在当天补一轮。
+		RunStampFile: stateSibling(cfg.StateFile, "task-runs.json"),
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -257,6 +259,7 @@ func main() {
 		APIKey:               cfg.APIKey,
 		APIKeys:              cfg.EffectiveKeys(),
 		ModelFallback:        cfg.Pool.ModelFallback,
+		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
@@ -552,6 +555,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		APIKey:               newCfg.APIKey,
 		APIKeys:              newCfg.EffectiveKeys(),
 		ModelFallback:        newCfg.Pool.ModelFallback,
+		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,

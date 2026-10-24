@@ -68,6 +68,11 @@ type Config struct {
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 
+	// ModelsHidden 模型黑名单原始条目（config models.hidden）：裸名 = cn/global
+	// 两域都隐藏，带 cn:/global: 前缀只隐藏该域。列表不列、点名调用直接 400。
+	// 热改走 Live 快照（HiddenModels），本字段只用于未接 Live 的静态路径。
+	ModelsHidden []string
+
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
@@ -159,6 +164,9 @@ type Handler struct {
 	// 手动补跑去重（/admin/tasks）：同名任务同时只跑一个。
 	taskMu      sync.Mutex
 	taskRunning map[string]bool
+
+	// modelsHidden 静态配置下的黑名单集合（Live 快照优先；见 hiddenModel）。
+	modelsHidden map[string]struct{}
 }
 
 // NewHandler 构建 handler。
@@ -175,13 +183,15 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), budget: newDailyBudget(cfg.BudgetLimit), taskRunning: map[string]bool{}}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), budget: newDailyBudget(cfg.BudgetLimit), taskRunning: map[string]bool{},
+		modelsHidden: livecfg.NormalizeHiddenModels(cfg.ModelsHidden)}
 	h.budget.applyConfig(cfg.BudgetLimit, cfg.BudgetBurstLimit, cfg.BudgetCacheLowRate)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
+	h.mux.HandleFunc("POST /v1/fetch", h.withAuth(h.fetch))
 	// Anthropic Messages 与 Codex Responses 两种入站协议：各自转成 chat_completions
 	// 后复用同一套取号/轮转/计费/SSE 透传，协议壳只做形状转换。
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
@@ -513,12 +523,31 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	return entry
 }
 
+// hiddenModel 报告 (realm, 裸模型名) 是否被 config models.hidden 隐藏。
+//
+// 黑名单语义是「这个模型对本网关不存在」：列表不列、点名调用直接拒绝。四个生效点
+// （cn 列表 / global 列表 / chat 入口 / 出图入口）共用本判据，避免各写一份漏掉某一处。
+func (h *Handler) hiddenModel(realm, bare string) bool {
+	if bare == "" {
+		return false
+	}
+	if h.cfg.Live != nil {
+		_, hide := h.cfg.Live.Load().HiddenModels[realm+":"+bare]
+		return hide
+	}
+	_, hide := h.modelsHidden[realm+":"+bare]
+	return hide
+}
+
 // modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
 // 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
+		if h.hiddenModel("cn", mi.ID) {
+			continue
+		}
 		entry := map[string]any{
 			"id":       "cn:" + mi.ID,
 			"object":   "model",
@@ -562,6 +591,9 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
+			if h.hiddenModel("global", id) {
+				continue
+			}
 			entry := map[string]any{
 				"id":       "global:" + id,
 				"object":   "model",
@@ -736,6 +768,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 密钥级模型白名单：名单外模型直接 403，不选号、不打上游、不扣额度。
 	// 未鉴权部署（密钥表为空）没有密钥身份 → 视为不限制；密钥名单为空同样不限制。
+	// 全局黑名单（models.hidden）先于白名单：模型对网关不存在，与持有哪把密钥无关。
+	if h.hiddenModel(realm, bareModel) {
+		st.status = http.StatusBadRequest
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			peek.Model+" 已被网关配置隐藏（models.hidden），请换一个模型")
+		return
+	}
 	if bareModel != "" && !authKey.AllowsModel(realm, bareModel) {
 		// 先落状态再拒绝：st.done() 的流水行与 requestTrace.event 的归档事件
 		// 都从 st 取状态，这样 403 会带着请求模型出现在两处。
@@ -1790,10 +1829,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// ErrContentBlocked 待遇）；chatCompletions 已 fail-fast 503 透传原文、
 		// 终止轮转——该分支只为文档完备。
 	case upstream.ErrModelBlocked:
-		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
-		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
-		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
-		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		// 11102「该后端无此模型」/ 11158「账号类型无权使用」：(账号, 模型) 负缓存避让。
+		// 复用 modelCooldowns 机制（与 6004 同域），选号侧 healthyForModel 对该账号自动
+		// 避开该模型。立即换号（本轮 continue），下次选号避开。
+		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReasonFor(body))
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 		// ErrClient（未知 4xx）喂连败计数（issue #114）：连续 N 次该形态失败 →

@@ -362,6 +362,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_keys[].daily_request_limit` | `0` | **每日模型请求数上限**（CST 自然日）：通过配额检查时 +1，被上游拒绝的请求也计入；`0` = 不限制。旧版 `config.api_key` 不参与配额 |
 | `api_keys[].rpm_limit` | `0` | **每分钟请求数上限**（滑动 60 秒窗口，含 chat / messages / responses 与出图）：超限返回 429 `rate_limit_exceeded` + `Retry-After`（窗口腾出的秒数），不选号、不打上游；`0` = 不限制。只统计通过准入的客户端请求，被拒请求不消耗日请求数；窗口在内存中维护，重启清零 |
 | `api_keys[].max_concurrency` | `0` | **同时在途请求上限**（流式请求到最后一帧才算结束，含出图）：超限返回 429 `rate_limit_exceeded` + `Retry-After: 1`；`0` = 不限制。建议所有密钥的并发上限之和不超过账号数，避免互相抢号 |
+| `models.hidden` | `[]` | **全局模型黑名单**：裸名（`glm-5.2`）对 cn/global 两个域都隐藏，`cn:` / `global:` 前缀只隐藏该域。`GET /v1/models` 不列、chat / 出图点名调用直接 400 `model_unavailable`（知道名字也调不到）；保存后热生效 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
@@ -612,6 +613,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 - **空数组与 `null` 表示「未配置 → 回落默认」**，不是「禁用」；真正关闭请用 `*_enabled: false`
 - **禁用不会擦除小时配置**：`*_hours` 原样保留，改回 `true` 即恢复原时点；小时值必须是 0-23，非法值启动即报错
+- **启动补跑**：进程停机跨过当天时点时，启动后按天补跑一轮；`task-runs.json`（与 `state.json` 同目录）记录当天已补跑的任务类型，同一天多次重启只补一次
 - 关签到会把「余额恢复即解冻」一起关掉，被硬冷却的账号只能等次日 04:00 自然到期
 
 #### 活跃上报（独立排程）
@@ -718,11 +720,12 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB。思考吃光 `max_tokens` 导致正文 0 字节时，自动**同额度关思考重发一次**（客户端只看到正文） |
 | `POST /v1/responses` | Bearer | Codex Responses 协议适配（转 chat_completions；`response.*` 事件族、`reasoning_summary_*`、截断 `response.incomplete`） |
 | `POST /v1/messages`（`/messages`） | `x-api-key` / Bearer | Anthropic Messages 协议适配（`message_start` / `content_block_*` / `message_delta`）；客户端声明 `web_search` 时由网关代执行检索 |
 | `POST /v1/images/generations` · `/v1/images/edits` | Bearer | 图像生成/编辑（CN `hunyuan-image-alpha`、global `gpt-image-2.5-sunburst`） |
 | `POST /v1/search` | Bearer | 官方 agenttool 联网检索（snippet；`deep=true` 走综述式 agentic_search） |
+| `POST /v1/fetch` | Bearer | DSH Fetch API 兼容：`{"url":"https://..."}` → `{"content":"<markdown>"}`（上游 `agenttool/v1/webfetch`；缺 content 按 502） |
 | `POST /v2/chat/busy` | Bearer | 官方客户端模型忙闲预检：`{"models":[...]}` → `busy_level` = `idle` / `busy`（该域全池模型级冷却）/ `unknown`（不在服务目录）。本地按池状态计算，不打上游 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |

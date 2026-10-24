@@ -49,6 +49,21 @@ func isDeepSeekModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
 }
 
+// ThinkingSwitchSupported 该模型能否用 thinking.type=disabled 关掉思考。
+//
+// 目前只有 DeepSeek 系：thinking.go 只对这类模型注入 thinking 字段，也只有它
+// 验证过「disabled + 同额度 → 正文正常」。入参可带 cn:/global: 前缀。
+func ThinkingSwitchSupported(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.IndexByte(m, ':'); i > 0 {
+		switch m[:i] {
+		case "cn", "global":
+			m = m[i+1:]
+		}
+	}
+	return isDeepSeekModel(m)
+}
+
 // backfillReasoningContent DeepSeek 多轮一致性：保证每条 assistant 消息带
 // reasoning_content 字段且值为 string——即 requiresReasoningContentOnAssistantMessages
 // （官方客户端 matches 规则，issue #165 对齐官方 apply 门控）。
