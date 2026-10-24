@@ -561,6 +561,40 @@ func TestStatusCoolKindDefaultsWhenNotCooling(t *testing.T) {
 	}
 }
 
+// TestStatusReasonOnlyWhileActive 冷却结束后面板不得残留「429 rate limit」标签：
+// entry.reason 在自然到期时没人清（惰性清理只在迁移路径发生），状态输出必须
+// 以 until 是否仍在未来为准，而不是无条件透传 entry.reason。
+func TestStatusReasonOnlyWhileActive(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.Reason != "429 rate limit" {
+		t.Fatalf("冷却中 status=%+v，应带原因", st)
+	}
+
+	// 模拟两小时软冷却自然到期（entry.reason 仍保留）。
+	p.mu.Lock()
+	p.byUID["u1"].until = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+
+	st, _ = p.Status("u1")
+	if st.Cooling {
+		t.Fatalf("已过期仍报 Cooling: %+v", st)
+	}
+	if st.Reason != "" {
+		t.Errorf("冷却到期后 Reason=%q，应为空（面板不应再显示限流标签）", st.Reason)
+	}
+
+	// 禁用原因仍须透出（DisabledReason 与 Reason 同源）。
+	p.Disable("u1", "account banned")
+	st, _ = p.Status("u1")
+	if st.Reason != "account banned" || st.DisabledReason != "account banned" {
+		t.Errorf("禁用后 reason=%q disabled_reason=%q", st.Reason, st.DisabledReason)
+	}
+}
+
 func TestNextDay4AMBoundaries(t *testing.T) {
 	cases := []struct {
 		name string

@@ -558,31 +558,39 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 		CreditsEarliestRemaining: e.creditsEarliestRemaining,
 		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:                   e.reason,
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:               e.tokenUsage,
-		LastSuccessTime:          e.lastSuccess,
-		LastErrTime:              e.lastErr,
-		Until:                    e.until,
-		SoftStreak:               e.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(e, now),
-		ModelOff:                 modelOffEntries(e.modelOff),
-		ConsecutiveFails:         e.consecutiveFails,
-		SessionDeadFails:         e.sessionDeadFails,
-		DegradeUntil:             e.degradeUntil,
-		InFlight:                 int(e.inFlight.Load()),
-		BreakerFails:             e.fails,
-		BreakerUntil:             e.breakerUntil,
+		// Reason 只随「仍在生效」的异常状态输出：entry.reason 是惰性清理的，
+		// 冷却自然到期时不会有人去清它。若无条件透传，面板会永久显示
+		// 「429 rate limit」——冷却早已结束，标签却还在。下面按 disabled / 冷却域
+		// 分别回填；熔断（breakerUntil）不写 reason，故仅熔断时不回填。
+		Reason:           "",
+		Disabled:         e.disabled,
+		Paused:           e.paused,
+		SuccessCount:     e.successCount,
+		ErrTotal:         e.errTotal,
+		CheckinDone:      e.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:       e.tokenUsage,
+		LastSuccessTime:  e.lastSuccess,
+		LastErrTime:      e.lastErr,
+		Until:            e.until,
+		SoftStreak:       e.softStreak,
+		ModelCosts:       p.modelCostsStatusLocked(e, now),
+		ModelOff:         modelOffEntries(e.modelOff),
+		ConsecutiveFails: e.consecutiveFails,
+		SessionDeadFails: e.sessionDeadFails,
+		DegradeUntil:     e.degradeUntil,
+		InFlight:         int(e.inFlight.Load()),
+		BreakerFails:     e.fails,
+		BreakerUntil:     e.breakerUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		st.DisabledReason = e.reason
+		st.Reason = e.reason
 	}
 	if st.Cooling {
+		if now.Before(e.until) {
+			st.Reason = e.reason // 冷却域原因：until 到期后不再输出
+		}
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
 		// 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，
 		// 取仍在未来且更晚截止的那个，避免仅熔断期时误报 0 / unknown。
