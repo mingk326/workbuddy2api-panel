@@ -282,11 +282,17 @@ func (a *Auth) SupportsPersonalGrowth() bool { return !a.IsEnterprise() && !a.Is
 // 与 SupportsPersonalGrowth（执行类门控）刻意分开命名：两者当前判据相同，但语义不同。
 func (a *Auth) SupportsPersonalEndpoints() bool { return !a.IsEnterprise() && !a.IsAPIKey() }
 
-// isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
-// 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
+// isGlobalDomain 判定 domain 是否指向国际站域（workbuddy.ai / codebuddy.ai 家族）。
+// 同时接受裸域与任意子域（HasSuffix 或裸域本身）；两套主机名同后端，都判 global。
 func isGlobalDomain(d string) bool {
 	d = strings.ToLower(strings.TrimSpace(d))
-	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+	if d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai") {
+		return true
+	}
+	// 官方 CLI 国际站域（product.json externalDomain: www.codebuddy.ai）。与 workbuddy.ai
+	// 同后端不同主机名，但 domain 落盘值不同，不认它会把国际站账号误判成 cn
+	// （显式 realm 键可兜住面板登录的账号，手写 auth 文件则直接错域路由）。
+	return d == "codebuddy.ai" || strings.HasSuffix(d, ".codebuddy.ai")
 }
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。

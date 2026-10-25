@@ -13,6 +13,7 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -136,10 +137,12 @@ func (p *Panel) unlockAccount(uid string) {
 // 防止"开了添加账号弹窗就走开"的会话永久滞留。
 const loginTTL = 15 * time.Minute
 
-// loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）。
+// loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘）+ 站点
+// （cn/intl/workbuddy，poll 用同一站点取 token）。
 type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
+	site    string // "cn" / "intl" / "workbuddy"，缺省按空串回落 cn
 	// processing 该 state 正在落盘（含签到/余额校验等副作用）。
 	// 前端每 3s 轮询，而成功分支的副作用可能耗时数秒（UserResource 慢时更久）：
 	// 没有这个闸门，第二个并发 poll 会把整段流程（落盘/签到/入池）再跑一遍。
@@ -194,6 +197,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_off", p.withAuth(p.accountModelOff))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_on", p.withAuth(p.accountModelOn))
+	// 封禁账号探活：只读探测上游是否已解封，不 revive、不参与选号。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/probe_ban", p.withAuth(p.accountProbeBan))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	// 单号旅行（issue #227）：与 checkin 同构，供外部调度器做「每号独立随机时点」。
@@ -1112,4 +1117,112 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+// accountProbeBan 探测被封禁账号在上游是否已解封（**只读**，不改池状态）。
+//
+// 为什么需要它：禁用账号（11140 风控）想恢复只能人工点「解冻」，但运维不知道
+// 上游到底解没解封——盲目 revive 再被拒会反复触发风控，加重判定。需要一个
+// 「不惊动它」的问法。
+//
+// 用什么探：UserResource（余额查询）是最轻的只读端点，且 11140 会在这里原样返回
+// （上游 auth/auth_forbidden 在 billing 侧同样生效）。不用 chat —— 那会占在途、
+// 记连败、可能被计入风控。
+//
+// 判据：
+//   - 200            → 已解封（可以 revive 了）
+//   - 11140/封禁类   → 仍被封（继续等）
+//   - 401/session    → 不是封禁问题，是登录失效（该重登）
+//   - 其它           → 无结论（网络/限流等，稍后再试）
+//
+// 不写任何池状态：探测是观测行为，不该改变账号的可用性判断 —— 否则运维点一下
+// 探活就把号放回池子，等于变相 revive。
+func (p *Panel) accountProbeBan(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	st, ok := p.cfg.Pool.Status(uid)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		writeErr(w, http.StatusNotFound, "account credentials not found")
+		return
+	}
+	resp := map[string]any{
+		"ok":           true,
+		"uid":          uid,
+		"nickname":     st.Nickname,
+		"was_disabled": st.Disabled,
+		"was_reason":   st.DisabledReason,
+		"probed_at":    time.Now().Format(time.RFC3339),
+	}
+	if p.cfg.Upstream == nil {
+		resp["verdict"] = "unknown"
+		resp["detail"] = "upstream client not configured"
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	_, _, err := p.cfg.Upstream.UserResource(a)
+	// 网关 401 的求证与 chat 路径同一套判据（upstream.VerifySessionByRefresh）：
+	// 封禁（11140）与登录失效的响应体都是 APISIX HTML 页，单看 401 分不出来。
+	if err != nil && isSessionDeadErr(err) {
+		switch p.cfg.Upstream.VerifySessionByRefresh(a) {
+		case upstream.VerifyAlive:
+			resp["verdict"] = "blocked"
+			resp["detail"] = err.Error()
+			resp["advice"] = "会话仍有效，但请求被上游风控拦截（可能仍是 11140 封禁）—— 继续观察，勿反复 revive"
+			log.Printf("panel: probe_ban uid=%s → 被拦截但会话有效（refresh ok）", uid)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		case upstream.VerifyInconclusive:
+			resp["verdict"] = "inconclusive"
+			resp["detail"] = err.Error()
+			resp["advice"] = "refresh 未给出明确判词（网络/限流等），稍后再试"
+			log.Printf("panel: probe_ban uid=%s → 无明确结论", uid)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		// VerifyDead：落到下面的 session_dead 分支。
+	}
+	switch {
+	case err == nil:
+		resp["verdict"] = "lifted"
+		resp["advice"] = "上游已解封，可以点「解冻」恢复使用"
+		log.Printf("panel: probe_ban uid=%s → 已解封", uid)
+	case isAccountFaultErr(err):
+		resp["verdict"] = "still_banned"
+		resp["detail"] = err.Error()
+		resp["advice"] = "仍被封禁，继续等待；勿反复 revive（可能加重风控）"
+		log.Printf("panel: probe_ban uid=%s → 仍被封", uid)
+	case isSessionDeadErr(err):
+		resp["verdict"] = "session_dead"
+		resp["detail"] = err.Error()
+		resp["advice"] = "不是封禁问题，是登录态失效 —— 需重新登录"
+		log.Printf("panel: probe_ban uid=%s → 登录失效（非封禁）", uid)
+	default:
+		resp["verdict"] = "inconclusive"
+		resp["detail"] = err.Error()
+		resp["advice"] = "无明确结论（网络/限流等），稍后再试"
+		log.Printf("panel: probe_ban uid=%s → 无结论: %v", uid, err)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// isAccountFaultErr 判断错误是否为账号级封禁/风控（11140 request illegal 等）。
+func isAccountFaultErr(err error) bool {
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	return ue.Kind == upstream.ErrAccountFault
+}
+
+// isSessionDeadErr 判断错误是否为登录态失效。
+func isSessionDeadErr(err error) bool {
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	return ue.Kind == upstream.ErrSessionDead
 }

@@ -91,13 +91,14 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
-func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
+// TestCooldownSoftForModelFullResetAtKeepsResetAt 6004 写 modelCooldowns：
+// until 完整对齐上游重置墙钟（**不被 soft_rate_max 截断**），reset_at 保留原文。
+// 截断到 2h 会让网关在上游重置前盲目重试、白打 429。
+func TestCooldownSoftForModelFullResetAtKeepsResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
+	reset := time.Now().Add(2 * time.Hour) // 远超 soft_rate_max → 仍按上游墙钟，不截断
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
@@ -105,8 +106,8 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("Until=%v want 完整对齐 reset=%v (diff %v)", mc.Until, reset, d)
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
 		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)
@@ -200,6 +201,65 @@ func TestModelCooldownsSurviveRevive(t *testing.T) {
 	}
 	if rem := time.Until(mc.Until); rem < 55*time.Minute || rem > time.Hour+time.Minute {
 		t.Errorf("6004 until 应保持 ~1h 不变, got remaining=%v", rem)
+	}
+}
+
+// TestModelBlockedReasonsCollected ModelBlockStatus 收集每个被挡账号的锁因，
+// 且 Reason/Until 取自同一条（最早解封）：调用方据此判断「是不是清一色用量配额」。
+func TestModelBlockedReasonsCollected(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	now := time.Now()
+	resetA := now.Add(2 * time.Hour)
+	resetB := now.Add(30 * time.Minute)
+	p.CooldownSoftForModel("u1", 600*time.Second, resetA, "m1", `{"code":6004,"msg":"usage limit, reset at 2026-10-25 20:00:00"}`)
+	p.CooldownSoftForModel("u2", 600*time.Second, resetB, "m1", "11102 model [m1] not found")
+
+	st := p.ModelBlockedForRealm("m1", "")
+	if !st.Blocked || st.Count != 2 {
+		t.Fatalf("Blocked=%v Count=%d want true/2", st.Blocked, st.Count)
+	}
+	if len(st.Reasons) != 2 {
+		t.Fatalf("Reasons=%v want 2 条（每号一条锁因）", st.Reasons)
+	}
+	if d := st.Until.Sub(resetB); d < -time.Second || d > time.Second {
+		t.Errorf("Until=%v want 最早解封 %v", st.Until, resetB)
+	}
+	if !strings.HasPrefix(st.Reason, "11102") {
+		t.Errorf("Reason=%q 应跟随最早解封那条（11102）", st.Reason)
+	}
+}
+
+// TestCooldownModelBusyShortWindow 14003 只停 (账号, 模型) 一个短窗口：
+// 10s 起、窗口内重复命中不延长、账号级 until 保持零值（同号换模型立即可用）。
+func TestCooldownModelBusyShortWindow(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	start := time.Now()
+	p.CooldownModelBusy("u1", "m1", "14003 model busy")
+
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	mc, ok := e.modelCooldowns["m1"]
+	until := e.until
+	p.mu.RUnlock()
+	if !ok {
+		t.Fatal("modelCooldowns[m1] 应写入 14003 短冷却")
+	}
+	if rem := mc.Until.Sub(start); rem < 9*time.Second || rem > 11*time.Second {
+		t.Errorf("首档冷却=%v want ~10s（不套 soft_rate 的 600s 阶梯）", rem)
+	}
+	if !until.IsZero() {
+		t.Errorf("账号级 until=%v 应为零值（14003 只停该模型）", until)
+	}
+	// 窗口内重复命中：不延长（并发请求/兜底探测不得堆成分钟级）。
+	p.CooldownModelBusy("u1", "m1", "14003 model busy")
+	p.mu.RLock()
+	mc2 := e.modelCooldowns["m1"]
+	p.mu.RUnlock()
+	if !mc2.Until.Equal(mc.Until) {
+		t.Errorf("窗口内重复命中把 Until 从 %v 推到 %v（不该延长）", mc.Until, mc2.Until)
 	}
 }
 

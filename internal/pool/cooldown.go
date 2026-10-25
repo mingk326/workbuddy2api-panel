@@ -139,9 +139,9 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）：把该模型的冷却截止
 // 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
 //
-//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
-//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
-//     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
+//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = resetAt（**完整对齐
+//     上游墙钟，不被 softRateMax 截断**），ResetAt 记录上游原始墙钟（台账 ResetAt）。
+//     不写 until（全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
 //   - resetAt 零值且 model 非空（6004/14003 无时间文案）→ 只把 **(账号, 模型)** 停车：
 //     modelCooldowns[model].Until = now + 有界退避（base 起按 Hits 翻倍、封顶
 //     softRateMax），**不写 until**。上游语义就是「这个模型忙，换模型」，按账号冷却
@@ -157,12 +157,19 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
 		if !resetAt.IsZero() {
-			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
+			// 有上游重置时间：模型级冷却**完整对齐上游墙钟**，不用 softRateMax 截断——
+			// 封顶只针对账号级软冷却（CooldownSoftRate）。模型级冷却只停这一个模型，
+			// 同号其他模型照常可用，按上游说的时刻恢复才是正确语义（截断到 2h 会让
+			// 网关在上游重置前盲目重试，白打 429）。resetAt 已过期时立即恢复。
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
+			until := resetAt
+			if !until.After(now) {
+				until = now.Add(time.Millisecond)
+			}
 			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedSoftUntilLocked(now, resetAt),
+				Until:   until,
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
@@ -193,6 +200,58 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 		}
 		p.dirty.Store(true)
 	}
+}
+
+// modelBusyBase/modelBusyMax 14003「模型繁忙」的独立停车窗口。
+//
+// 不复用 soft_rate 家族：那套阶梯（默认 600s 起、按命中翻倍、封顶 2h）是给
+// 「这个账号/模型被持续限流」准备的，惩罚一次瞬时抖动代价过高。14003 的
+// displayMsg 就是「模型繁忙，请换模型或稍后重试」——它是**间歇**的：生产日志里
+// 同一分钟内既有 14003 也有成功（issue #46），所以首档取 10s 而不是分钟级：
+// 三个号的冷却叠在一起时，60s 首档会把 10 秒的抖动放大成一整段客户端可见的断流。
+// 同一 (号, 模型) 反复命中再翻倍，封顶 1 分钟——宁可多交一次 429，也不要把
+// 一个间歇繁忙的模型停成整分钟不可用。
+const (
+	modelBusyBase = 10 * time.Second
+	modelBusyMax  = time.Minute
+)
+
+// CooldownModelBusy 把 (账号, 模型) 停一个短窗口（14003 模型繁忙专用）。
+//
+//   - 只写 modelCooldowns[model]，不碰账号级 until：同号换模型立即可用。
+//   - 同一窗口内重复命中不延长（并发请求/兜底探测不得把 60s 堆成分钟级）。
+//   - 已有更晚的冷却（6004 墙钟 / 11102 负缓存）时保留原截止，不缩短。
+func (p *Pool) CooldownModelBusy(uid, model, reason string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	if old, exists := e.modelCooldowns[model]; exists && old.Until.After(now) {
+		return
+	}
+	if e.modelCooldowns == nil {
+		e.modelCooldowns = map[string]modelCooldown{}
+	}
+	hits := e.modelCooldowns[model].Hits + 1
+	d := modelBusyBase
+	for i := 1; i < hits && d < modelBusyMax; i++ {
+		d *= 2
+	}
+	if d > modelBusyMax {
+		d = modelBusyMax
+	}
+	e.modelCooldowns[model] = modelCooldown{
+		Until:  now.Add(d),
+		Reason: reason,
+		Hits:   hits,
+	}
+	p.dirty.Store(true)
 }
 
 // RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
@@ -319,9 +378,12 @@ func (p *Pool) BlockModelClear(uid, model string) {
 // ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
 type ModelBlockStatus struct {
 	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
-	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
+	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）；取最早解封的那条
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// Reasons 每个被挡账号的锁因（与 Count 等长）。Reason 只有一条，分不清「全池
+	// 是不是同一个原因」；调用方按需聚合（如「是不是清一色用量配额 6004」）。
+	Reasons []string
 }
 
 // ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
@@ -370,14 +432,19 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 		}
 		st.Count++
 		if mc, ok := e.modelCooldowns[model]; ok {
-			if st.Reason == "" {
-				st.Reason = mc.Reason
-			}
-			// 取最早解封：那才是"再等多久值得重试"的答案。
+			st.Reasons = append(st.Reasons, mc.Reason)
+			// 取最早解封：那才是"再等多久值得重试"的答案。Reason 跟着这条走，
+			// 保证「原因」与「解锁时刻」出自同一个账号，不会张冠李戴。
 			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
 				st.Until = mc.Until
+				st.Reason = mc.Reason
 			}
 		}
+	}
+	if st.Reason == "" && len(st.Reasons) > 0 {
+		// 全都没有解封时刻（如 14003 无墙钟的有界退避）：退回第一条，
+		// 保持「Blocked 必有 Reason」的既有语义。
+		st.Reason = st.Reasons[0]
 	}
 	if st.Count == 0 {
 		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。

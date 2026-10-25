@@ -23,6 +23,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/loginsite"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -249,6 +250,19 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 //     （2026-10-16 线上：6 个并发请求 76 秒冷掉整池 → 全站 503 十分钟）。
 const modelRateLimitCodes = "6004|14003"
 
+// modelBusyCode 上游「模型繁忙」的业务码（14003）：瞬时繁忙，body 里没有任何
+// 重置时刻，与带墙钟的 6004 分属两种处置（见 IsModelBusy）。
+const modelBusyCode = "14003"
+
+// modelUsageLimitCode 上游「用量频率限制」的业务码（2026-10 实测出现在 kimi 系模型）。
+// 与 6004 同属模型级——msg 明确写「您也可以切换其他模型继续使用」——但 code 不同，
+// 只收进 modelRateLimitCodes 会连账号级 6000 一起放宽，故单独判定：code 6000 且
+// 文案命中 modelSwitchModelHint 才按模型级处理。
+const modelUsageLimitCode = "6000"
+
+// modelSwitchModelHint 官方在模型级用量限流答复里给出的换模型提示语。
+const modelSwitchModelHint = "切换其他模型"
+
 // softRateResetPatternCN/EN 匹配重置文案（CN「将在 … 重置」/ global 域英文
 // "reset at <固定格式时间>"），捕获中间的时间串。
 const softRateResetPatternCN = `将在 (.+?) 重置`
@@ -259,6 +273,8 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
 	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?(` + modelRateLimitCodes + `)"?`)
+	reModelUsageLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelUsageLimitCode + `"?`)
+	reModelBusy       = regexp.MustCompile(`"code"\s*:\s*"?` + modelBusyCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -266,11 +282,27 @@ var (
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
 
-// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004 / 14003）。
+// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004 / 14003 / 6000）。
 // 用于区分"账号级软限流"（按账号冷却）与"模型级限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
-	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	return reModelRateLimit.MatchString(body)
+	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差），
+	// 14003 同理。
+	if reModelRateLimit.MatchString(body) {
+		return true
+	}
+	// 6000 需要文案佐证：官方在「单模型用量超限」时会写「您也可以切换其他模型继续使用」，
+	// 真正的账号级限制不会这么提示。只凭 code 放宽会把整号受限误判成模型级。
+	return reModelUsageLimit.MatchString(body) && strings.Contains(body, modelSwitchModelHint)
+}
+
+// IsModelBusy 报告 body 是否是「模型繁忙」(code 14003)。
+//
+// 与 6004 的区别：6004 是额度窗口用满，带「将在 … 重置」的权威恢复时刻；
+// 14003 只是瞬时繁忙，body 里没有任何时间。前者该按上游墙钟停车，后者只能
+// 短窗口退避——套用 soft_rate（600s 起、翻倍到 2h）会把一次抖动变成十分钟
+// 不可用：一个请求轮转几个号，每个号都中 14003，几十秒内整池冷却 10 分钟。
+func IsModelBusy(body string) bool {
+	return reModelBusy.MatchString(body)
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
@@ -406,6 +438,16 @@ func hasBusinessEnvelope(body string) bool {
 // 403 含 accountFault 文案的维持现状（ErrAccountFault），由 Classify 的规则序保证。
 func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
+}
+
+// IsGatewayUnauthorized 报告 401 响应是否为**网关层授权拒绝页**（无业务信封）。
+//
+// 形态（2026-10 实测 CN 站 /v2/*，token 被上游判无效时）：APISIX/openresty 直接
+// 返回 HTML 页，没有 `"code":`/`"msg":` 信封。它与 WAF 403 的区别只在状态码。
+// 带业务信封的 401（如 {"code":12153,...}）由 Classify 的 sessionDead 层先捕获，
+// 走既有 ErrSessionDead 语义，不经过本函数。
+func IsGatewayUnauthorized(status int, body string) bool {
+	return status == http.StatusUnauthorized && !hasBusinessEnvelope(body)
 }
 
 // retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列：
@@ -800,21 +842,38 @@ func (c *Client) chatHTTP() *http.Client {
 	return c.HTTP
 }
 
-// defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
-const defaultGlobalBase = "https://www.workbuddy.ai"
+// defaultGlobalBase 缺省 global base（config 未覆盖、且 auth 文件未写 domain 时的兜底）。
+// 对齐官方 CLI：国际站是 www.codebuddy.ai（workbuddy.ai 是旧桌面端主机名，同后端）。
+const defaultGlobalBase = loginsite.BaseOfficial
 
-// globalChatBase 生效的 global chat base：Client.ChatBaseGlobal 非空取之，否则默认。
-func (c *Client) globalChatBase() string {
+// globalChatBase 生效的 global chat base，优先级：
+//
+//	config ChatBaseGlobal > auth 文件 domain 推出的官方主机 > defaultGlobalBase
+//
+// 按 domain 而不是按 realm 决定主机：国际域有两套主机名并存（老账号
+// workbuddy.ai、官方 CLI 新登录 codebuddy.ai），只按 realm 会把一半账号打到
+// 非其签发域。domain 为空（手写扁平 auth）才回落默认。
+func (c *Client) globalChatBase(a *auth.Auth) string {
 	if c.ChatBaseGlobal != "" {
 		return c.ChatBaseGlobal
+	}
+	if a != nil {
+		if b := loginsite.BaseForDomain(a.DomainValue()); b != "" {
+			return b
+		}
 	}
 	return defaultGlobalBase
 }
 
-// globalBillingBase 生效的 global billing base：Client.BillingBaseGlobal 非空取之，否则默认。
-func (c *Client) globalBillingBase() string {
+// globalBillingBase 生效的 global billing base（优先级同 globalChatBase）。
+func (c *Client) globalBillingBase(a *auth.Auth) string {
 	if c.BillingBaseGlobal != "" {
 		return c.BillingBaseGlobal
+	}
+	if a != nil {
+		if b := loginsite.BaseForDomain(a.DomainValue()); b != "" {
+			return b
+		}
 	}
 	return defaultGlobalBase
 }
@@ -867,7 +926,7 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
 
 func (c *Client) chatBase(a *auth.Auth) string {
 	if c.globalOn(a) {
-		return c.globalChatBase()
+		return c.globalChatBase(a)
 	}
 	return c.ChatBaseCN
 }
@@ -974,16 +1033,16 @@ func realmKey(realm string) string {
 
 func (c *Client) billingBase(a *auth.Auth) string {
 	if c.globalOn(a) {
-		return c.globalBillingBase()
+		return c.globalBillingBase(a)
 	}
 	return c.BillingBaseCN
 }
 
 // webBase 返回官网域（任务领奖类接口；未注入时回落默认）。
-// realm 感知：global 账号切国际站 workbuddy.ai，CN 用 workbuddy.cn。
+// realm 感知：global 账号按 auth domain 选官方主机，CN 用 workbuddy.cn。
 func (c *Client) webBase(a *auth.Auth) string {
 	if c.globalOn(a) {
-		return defaultGlobalBase
+		return c.globalChatBase(a)
 	}
 	if c.WebBaseCN != "" {
 		return c.WebBaseCN

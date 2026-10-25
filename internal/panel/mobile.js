@@ -38,8 +38,10 @@ const MobilePanel = (() => {
     out.push(action(u, 'models', '模型开关'));
     if (!s.enterprise && !s.api_key) out.push(action(u, 'tasks', '账号任务'));
     if (!s.enterprise && !s.api_key && s.realm !== 'global') out.push(action(u, 'travel', '旅行巡检'));
-    if (s.disabled || coolSeconds(s) > 0) out.push(action(u, 'revive', '解冻账号', true));
-    else if (s.paused) out.push(action(u, 'resume', '恢复选号', true));
+    if (s.disabled || coolSeconds(s) > 0) {
+      out.push(action(u, 'probe_ban', '探活'));
+      out.push(action(u, 'revive', '解冻账号', true));
+    } else if (s.paused) out.push(action(u, 'resume', '恢复选号', true));
     else out.push(action(u, 'pause', '暂停选号'));
     if (!s.disabled) out.push(action(u, 'disable', '禁用账号', false, true));
     out.push(action(u, 'remove', '移除账号', false, true));

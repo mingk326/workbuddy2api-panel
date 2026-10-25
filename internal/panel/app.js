@@ -489,6 +489,7 @@ function renderAccounts(list) {
         // 单号旅行（issue #227）：仅 CN 个人账号有成长体系；global 无任务体系。
         ((s.enterprise || s.api_key || s.realm === 'global') ? '' :
           '<button class="xs ghost" data-a="travel" data-u="' + esc(s.uid) + '" title="推进一趟猫猫旅行：无猫领养 / 有猫派出或领奖">旅行</button>') +
+        (frozen ? '<button class="xs ghost" data-a="probe_ban" data-u="' + esc(s.uid) + '" title="只读探测上游是否已解封：不 revive、不参与选号、不改任何状态">探活</button>' : '') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + ((s.enterprise || s.api_key) ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
@@ -628,6 +629,20 @@ async function accountAction(b) {
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
       toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+    } else if (a === 'probe_ban') {
+      // 只读探测：后端不改任何池状态，结论用 toast 说清处置动作，
+      // 而不是只报一句「仍被封」——运维要知道下一步做什么。
+      const r = await api('accounts/' + encodeURIComponent(u) + '/probe_ban', { method: 'POST' });
+      const map = {
+        lifted: ['已解封，可以点「解冻」恢复使用', 'ok'],
+        still_banned: ['仍被封禁，继续等待（勿反复 revive，可能加重风控）', 'warn'],
+        blocked: ['会话仍有效，但被上游风控拦截（可能仍是封禁）—— 继续观察', 'warn'],
+        session_dead: ['不是封禁问题 —— 登录态失效，需重新登录', 'warn'],
+        inconclusive: ['探测无明确结论（网络/限流等），稍后再试', 'warn'],
+        unknown: ['无法探测：上游客户端未配置', 'err'],
+      };
+      const m = map[r.verdict] || [r.verdict + (r.detail ? '：' + r.detail : ''), 'warn'];
+      toast(m[0], m[1]);
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');
@@ -1495,11 +1510,13 @@ document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
 });
 function startAddLogin() {
-  const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
+  // 站点（官方域表 cn/intl/workbuddy）：面板只传 site，realm 由后端按站点表决定，
+  // 避免前端自己维护一份域表。
+  const site = (document.querySelector('input[name="addSite"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
   loginFails = 0;
-  api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
+  api('login/start', { method: 'POST', body: JSON.stringify({ site }) }).then(r => {
     loginState = r.state;
     $('addUrl').textContent = r.url;
     $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
@@ -1520,6 +1537,15 @@ async function pollLogin() {
   try {
     const r = await api('login/poll?state=' + encodeURIComponent(loginState));
     loginFails = 0;
+    if (r.fatal) {
+      // 上游许可类终态（席位满 / 许可证过期 / 试用到期）：重试无意义，直接把上游
+      // 原话给用户（官方 SignLicenseError 行为）。
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addErr').hidden = false;
+      $('addErr').textContent = r.message || '登录被上游拒绝';
+      return;
+    }
     if (r.done) {
       stopPoll();
       $('addReady').hidden = true;

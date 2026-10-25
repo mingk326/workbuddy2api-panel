@@ -48,6 +48,8 @@ func TestRealmDomainFallback(t *testing.T) {
 		{"www.workbuddy.ai", "global"},
 		{"workbuddy.ai", "global"},
 		{"sub.workbuddy.ai", "global"},
+		{"www.codebuddy.ai", "global"}, // 官方 CLI 国际站域（与 workbuddy.ai 同后端）
+		{"codebuddy.ai", "global"},
 		{"www.codebuddy.cn", "cn"},
 		{"", "cn"},
 	}
@@ -198,6 +200,7 @@ func TestBackfillRealmDomain(t *testing.T) {
 		{"www.workbuddy.ai", "global"},
 		{"workbuddy.ai", "global"},
 		{"sub.workbuddy.ai", "global"},
+		{"www.codebuddy.ai", "global"},
 		{"www.codebuddy.cn", "cn"},
 		{"codebuddy.cn", "cn"},
 		{"", "cn"}, // 空 domain + 空 realm → cn（老 CN 凭证核心）
@@ -264,6 +267,8 @@ func TestResolveRealm(t *testing.T) {
 		{"cn", "www.workbuddy.ai", "cn"},         // 显式优先：global domain 也写 cn
 		{"", "www.workbuddy.ai", "global"},       // 缺省按 domain 推断
 		{"", "workbuddy.ai", "global"},
+		{"", "www.codebuddy.ai", "global"}, // 官方 CLI 国际站域
+		{"", "codebuddy.ai", "global"},
 		{"", "codebuddy.cn", "cn"},
 		{"", "", "cn"}, // 空 domain → cn（老 CN 凭证零回归）
 	}

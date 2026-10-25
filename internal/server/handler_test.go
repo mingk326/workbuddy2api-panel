@@ -895,21 +895,30 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
+// TestChatSessionDeadDisables 上游 401+12153 与保活同口径：连续 sessionDeadThreshold
+// 次才禁用。单次 12153 多为抖动/刷新竞态，一次就 Disable 是误杀（issue #83 配套）。
 func TestChatSessionDeadDisables(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	threshold := pool.SessionDeadThreshold()
+	for i := 1; i < threshold; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次即禁用（阈值 %d）", i, threshold)
+		}
+	}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	if rec.Code != 503 {
 		t.Errorf("code=%d", rec.Code)
 	}
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+		t.Errorf("连续 %d 次 401+12153 后应禁用: %+v", threshold, st)
 	}
 }
 
@@ -2003,5 +2012,121 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
 	if _, ok := msg["tool_calls"]; ok {
 		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
+	}
+}
+
+// TestModelBlockIsTransient 钉住「瞬时 vs 确定性」判据：14003/6004 可重试，
+// 11102/11158 只有换模型有效。
+func TestModelBlockIsTransient(t *testing.T) {
+	cases := map[string]bool{
+		"14003 model busy": true,
+		"6004 model rate limit, reset at 2026-10-21 10:00":  true,
+		"11102 model [glm-9] not found":                     false,
+		"11158 model [gpt-5.6-sol] is not allowed for user": false,
+		"": false,
+	}
+	for reason, want := range cases {
+		if got := modelBlockIsTransient(reason); got != want {
+			t.Errorf("modelBlockIsTransient(%q)=%v want %v", reason, got, want)
+		}
+	}
+}
+
+// TestChatModelQuotaEverywhereReturns429 全池该模型被 6004/6000 用量配额锁住：
+// 重置前重试必然同样失败 → 429 + 上游数字业务码 + **不带 Retry-After**，
+// 并且不打上游（选号阶段就该被挡）。
+func TestChatModelQuotaEverywhereReturns429(t *testing.T) {
+	cases := []struct {
+		name     string
+		reason   string
+		wantCode float64
+	}{
+		{"6004 额度窗口", `{"code":6004,"msg":"使用量已超出频率限制，将在 2026-10-25 20:00:00 重置","requestId":"r1"}`, 6004},
+		{"6000 kimi 用量频率", `{"code":6000,"msg":"您也可以切换其他模型继续使用","requestId":"r2"}`, 6000},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var calls int
+			up := newFakeUpstream(t, func(string) (int, string, bool) {
+				calls++
+				return 200, sseOK, true
+			})
+			p := testPoolWith(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "a", ExpiresAt: 9999999999})
+			reset := time.Now().Add(2 * time.Hour)
+			p.CooldownSoftForModel("g1", 10*time.Minute, reset, "deepseek-v4.1-flash", c.reason)
+
+			h := NewHandler(Config{Pool: p, Upstream: up})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(`{"model":"global:deepseek-v4.1-flash","messages":[]}`)))
+
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("code=%d want 429 body=%s", rec.Code, rec.Body)
+			}
+			if calls != 0 {
+				t.Errorf("calls=%d want 0（配额锁不该打上游）", calls)
+			}
+			if got := rec.Header().Get("Retry-After"); got != "" {
+				t.Errorf("Retry-After=%q，配额锁不该带该头（客户端会静默挂起）", got)
+			}
+			var resp struct {
+				Error struct {
+					Code    float64 `json:"code"`
+					Type    string  `json:"type"`
+					Message string  `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("bad response JSON: %v body=%s", err, rec.Body)
+			}
+			if resp.Error.Code != c.wantCode {
+				t.Errorf("error.code=%v want %v（数字业务码）", resp.Error.Code, c.wantCode)
+			}
+			if resp.Error.Type != "insufficient_quota" {
+				t.Errorf("error.type=%q want insufficient_quota", resp.Error.Type)
+			}
+			if !strings.Contains(resp.Error.Message, "code") {
+				t.Errorf("message 应透传上游原文: %q", resp.Error.Message)
+			}
+		})
+	}
+}
+
+// TestChatModelBusyEverywhereReturns503Retryable 全池该模型只是 14003 忙：
+// 必须给可重试语义（503 + Retry-After + code=model_busy），而不是 400
+// model_unavailable——后者会被客户端读成「模型被杀、重试无意义」。
+func TestChatModelBusyEverywhereReturns503Retryable(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "a", ExpiresAt: 9999999999})
+	p.CooldownModelBusy("g1", "deepseek-v4.1-flash", "14003 model busy")
+
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"global:deepseek-v4.1-flash","messages":[]}`)))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d want 503 body=%s", rec.Code, rec.Body)
+	}
+	if calls != 0 {
+		t.Errorf("calls=%d want 0（该模型在冷却，不该打上游）", calls)
+	}
+	if got := rec.Header().Get("Retry-After"); got == "" {
+		t.Error("缺 Retry-After 头：客户端无从知道等多久")
+	}
+	var resp struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response JSON: %v body=%s", err, rec.Body)
+	}
+	if resp.Error.Code != "model_busy" {
+		t.Errorf("error.code=%q want model_busy（可重试 ≠ 模型不可用）", resp.Error.Code)
 	}
 }

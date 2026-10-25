@@ -390,9 +390,17 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 	if st, _ := p.Status("u1"); st.Disabled {
 		t.Fatalf("刷新成功清计数后连续 2 次 12153 不应禁用: %+v", st)
 	}
-	s.RunKeepaliveNow() // 12153 #3（新计数）→ 禁用
-	if st, _ := p.Status("u1"); !st.Disabled {
-		t.Fatalf("新计数第 3 次 12153 应禁用: %+v", st)
+	// 刷新成功后 AT 有效期 3600s（仍可用）：按 issue #83 的判据，此时 refresh 判死
+	// 不计 session dead —— 账号 chat 仍正常，禁用它是误杀。
+	for i := 0; i < 3; i++ {
+		s.RunKeepaliveNow()
+	}
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Fatalf("AT 仍有效时不应禁用: %+v", st)
+	}
+	if st.SessionDeadFails != 0 {
+		t.Fatalf("AT 仍有效时不应累计 session dead, got %d", st.SessionDeadFails)
 	}
 }
 
@@ -460,7 +468,8 @@ func TestRunBalanceRefresh401SessionDeadDisables(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	// AT 已过期（上游批量注销会话的真实形态）：判据才允许计 session dead。
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: time.Now().Add(-time.Hour).Unix()})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up})
 

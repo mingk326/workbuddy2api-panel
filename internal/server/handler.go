@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -1157,30 +1158,42 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
-				lastErr = err
 				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					// 与保活同口径：连续 3 次 12153 才禁用。单次 12153 多为网络抖动 /
-					// 刷新竞态（并发刷新消费了同一个一次性 RT），一次就 Disable 会把
-					// 健康账号误踢成"掉登录"。
-					if h.cfg.Pool.NoteSessionDead(acct.UID) {
-						log.Printf("ERR: [server] chat refresh acct=%s: 连续 %d 次 12153 session dead — 禁用",
-							logfmt.Label(acct.UID, acct.Nickname), pool.SessionDeadThreshold())
-					}
+				sessionDead := errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead
+				// refresh token 失效 ≠ 账号不可用（issue #83）：AT 未过期时上游 chat
+				// 仍正常（生产实测 29 个号里 4 个 RT 恒回 12153、AT 还剩 26~333 天，
+				// chat 全 200）。这种号计死会在连续 3 轮后永久禁用一个健康账号。
+				// 不罚号也不换号，直接拿现有 AT 发这次请求；AT 真被上游拒时下游会走
+				// 网关 401 求证（applyErrorPolicy），那里 refresh 判死才计死。
+				if sessionDead && upstream.SessionDeadButUsable(acct) {
+					log.Printf("INFO: [server] chat refresh acct=%s: refresh 判死但 AT 仍有效，继续用现有 AT",
+						logfmt.Label(acct.UID, acct.Nickname))
 				} else {
-					h.cfg.Pool.NoteError(acct.UID)
+					lastErr = err
+					if sessionDead {
+						// 与保活同口径：连续 3 次 12153 才禁用。单次 12153 多为网络抖动 /
+						// 刷新竞态（并发刷新消费了同一个一次性 RT），一次就 Disable 会把
+						// 健康账号误踢成"掉登录"。
+						if h.cfg.Pool.NoteSessionDead(acct.UID) {
+							log.Printf("ERR: [server] chat refresh acct=%s: 连续 %d 次 12153 session dead — 禁用",
+								logfmt.Label(acct.UID, acct.Nickname), pool.SessionDeadThreshold())
+						}
+					} else {
+						h.cfg.Pool.NoteError(acct.UID)
+					}
+					fail(acct.UID)
+					if !rotateBackoff(i, r.Context()) {
+						break // ctx 取消：终止轮转（refresh 失败换号退避）
+					}
+					continue
 				}
-				fail(acct.UID)
-				if !rotateBackoff(i, r.Context()) {
-					break // ctx 取消：终止轮转（refresh 失败换号退避）
+			} else {
+				// 刷新成功即证明 session 仍存活：清连续 12153 计数（与保活同口径）。
+				h.cfg.Pool.ClearSessionDead(acct.UID)
+				if err := acct.SaveAtomic(); err != nil {
+					// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
+					log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
 				}
-				continue
-			}
-			// 刷新成功即证明 session 仍存活：清连续 12153 计数（与保活同口径）。
-			h.cfg.Pool.ClearSessionDead(acct.UID)
-			if err := acct.SaveAtomic(); err != nil {
-				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
 			}
 		}
 
@@ -1556,6 +1569,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
+	// quotaCode 非 0 时用「上游业务码」形态回 429（code 透出上游的 6004/6000，
+	// message 装上游原文）：客户端本来就按业务码判能不能重试，包成
+	// insufficient_quota 字符串反而让各家各猜一套（见 modelBlockAllQuota 分支）。
+	quotaCode := 0
+	// retryAfterSec 非 0 时写 Retry-After 头：只有「全池该模型只是忙/被限流」
+	// 这种可重试形态才有意义（见下方 modelBlock 分支）。
+	retryAfterSec := 0
 	// 上游超时：轮转已在传输层分支止损（见 isUpstreamTimeout），这里给一条**能区分**
 	// 的文案，别混进"没有可用账号"——两者的排查方向完全不同。
 	if errors.Is(lastErr, errUpstreamTimeout) {
@@ -1609,15 +1629,67 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			upstreamMsgPassed = true
 		}
 	}
-	// 模型级阻塞覆盖上面的通用文案（放在最后 = 优先级最高）。
-	//
+	// 模型级阻塞覆盖上面的通用文案（上游原文优先，本地信息进 hint）。
 	// 为什么能覆盖 code 而不丢信息：modelBlock.Reason 就是 BlockModelBackoff 存下的
 	// 上游原因，已在 hint 里原样带出，所以覆盖 message 不会丢掉上游信息，反而补上
 	// 了上游不会告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。
 	//
-	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
-	// 换号重试必然同样失败，客户端不该按可重试错误处理。
-	if modelBlock.Blocked {
+	// 轮转耗尽 / WAF 止损等其它退出路径不经过选号失败分支，modelBlock 还是零值：
+	// 在这里补一次快照。否则同一件「全池该模型只是忙」的事，走选号失败是
+	// 503 model_busy + Retry-After，走轮转耗尽却是 429 rate_limit_exceeded 且没有
+	// Retry-After（MaxRotate=1 时必现）。
+	if !modelBlock.Blocked {
+		modelBlock = h.cfg.Pool.ModelBlockedForRealm(curModel, realm)
+	}
+	switch {
+	case ue == nil && modelBlockAllQuota(modelBlock):
+		// 全池该模型的锁都是「用量配额」（6004/6000：上游明说用量已超出频率限制、
+		// 将在某时刻重置）。重置前重试**必然同样失败**，所以按配额语义回 429 + 上游
+		// 原文，且**不发 Retry-After**：客户端普遍把它当「睡多久」的指令（codebuddy
+		// CLI 直接 delayMs = retry-after×1000，不设上限），把几十分钟的冷却原样报
+		// 出去就是客户端静默挂起——比报错更难排查。
+		// 与下面 14003 的可重试分支互补：那个是瞬时繁忙（等就有效），这个是额度窗口
+		// （等到重置前都无效）。
+		status, quotaCode = http.StatusTooManyRequests, modelQuotaCode(modelBlock.Reason)
+		msg = "model usage limit reached on every account; retry after the quota window resets"
+		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
+			msg = s // 上游原文（含 code 6004 / 重置时刻 / requestId）
+		}
+		hint = fmt.Sprintf("model_quota: %d account(s) hit this model's usage limit", modelBlock.Count)
+		if !modelBlock.Until.IsZero() {
+			hint += "; resets at " + modelBlock.Until.Format(time.RFC3339)
+		}
+	case modelBlock.Blocked && modelBlockIsTransient(modelBlock.Reason):
+		// 全池该模型只是「忙」（14003：模型繁忙，等一等就好）；6004/6000 的用量配额
+		// 已在上面按不可重试处置，走到这里的是「等有意义」的那一类。
+		// 不是「这个模型不存在或这个号型不允许」——上游对这两种的处置完全不同：
+		// 忙是该等（官方客户端就是这么做的：查 /v2/chat/queue/status 排队），
+		// 而模型级 11102/11158 是换模型才有用。
+		//
+		// 此前一律回 400 model_unavailable，客户端（DeepSeekRuntime / Codex 等）
+		// 据此判定「模型被杀、重试无意义」，高峰期就表现为「DeepSeek 用不了」，
+		// 而官方客户端同一时刻还在排队等结果（issue #24）。这里改成可重试语义：
+		// 503 + Retry-After（= 最早解封时刻）+ code=model_busy，客户端按头等待重试。
+		code = "model_busy"
+		status = http.StatusServiceUnavailable
+		if !upstreamMsgPassed {
+			msg = "model is temporarily busy on every account (per-model cooldown); retry after the cooldown window"
+		}
+		hint = fmt.Sprintf("model_busy: %d account(s) cooling down this model", modelBlock.Count)
+		if !modelBlock.Until.IsZero() {
+			if d := time.Until(modelBlock.Until); d > 0 {
+				secs := int(math.Ceil(d.Seconds()))
+				retryAfterSec = secs
+				if retryAfterSec > maxRetryAfterSec {
+					retryAfterSec = maxRetryAfterSec // 头是「睡多久」的指令，见常量注释
+				}
+				hint += fmt.Sprintf("; earliest unblock in %ds", secs)
+			}
+		}
+		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
+			hint += "; upstream: " + s
+		}
+	case modelBlock.Blocked:
 		code = "model_unavailable"
 		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
 		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
@@ -1633,7 +1705,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		status = http.StatusBadRequest
 	}
-	writeOpenAIErrorHint(w, status, code, msg, hint)
+	if retryAfterSec > 0 {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfterSec))
+	}
+	if quotaCode != 0 {
+		writeModelQuotaError(w, quotaCode, msg, hint)
+	} else {
+		writeOpenAIErrorHint(w, status, code, msg, hint)
+	}
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
 }
@@ -1775,6 +1854,40 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 // 携带的模型名。uerr 是 ChatStreamContext 返回的分类信封（可携带 RetryAfter）；
 // 零值/防御路径下为 nil，冷却时长回落既有计算。
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
+	// 网关 401（无业务信封的 APISIX/openresty HTML 页）先 refresh 求证再决定罚不罚：
+	// 响应体与「token 真失效」完全一样，单看 401 分不出来（2026-10-24 issue #66：
+	// 两号各累计 3 次 401 被禁，revive 后立刻全 200，即瞬时拦截）。
+	//
+	// 代价：每个网关 401 多一次 refresh 往返；refresh 轻量且 401 低频，另由下面的
+	// 软冷却兜住「同一账号每请求都来问一次」。
+	if uerr != nil && upstream.IsGatewayUnauthorized(uerr.Status, body) {
+		if acct := h.cfg.Pool.AuthByUID(uid); acct != nil && h.cfg.Upstream != nil {
+			switch h.cfg.Upstream.VerifySessionByRefresh(acct) {
+			case upstream.VerifyAlive:
+				// 上游已轮换 RT：必须落盘，否则重启拿旧 RT 刷新 = 账号真死。
+				if serr := acct.SaveAtomic(); serr != nil {
+					log.Printf("ERR: [server] 网关 401 后 refresh 成功但落盘失败: %v", serr)
+				}
+				h.cfg.Pool.ClearSessionDead(uid)
+				// 用 CooldownSoftRate 而非固定 Cooldown：60s 起按 softStreak 翻倍
+				// （封顶 soft_rate_max），任何一次成功即清零。防「chat 恒 401 但
+				// refresh 恒成功」的降级 token 每 60s 轮换一次 RT。
+				h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "gateway 401 (refresh ok, transient)")
+				log.Printf("INFO: [server] 账号 %s 网关 401 但 refresh 成功 → 瞬时拦截，不计 session dead",
+					logfmt.Label(uid, ""))
+				return
+			case upstream.VerifyInconclusive:
+				// refresh 未给出明确判词（网络/5xx/429/refresh 端点自身被拦）：
+				// 既不能判活也不能判死，只短退避。判死会在同一层再误杀一次。
+				h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "gateway 401 (refresh inconclusive)")
+				log.Printf("INFO: [server] 账号 %s 网关 401，refresh 未给出明确判词 → 不计 session dead",
+					logfmt.Label(uid, ""))
+				return
+			}
+			// VerifyDead：refresh 被应用层明确拒绝，落到下面的计死逻辑。
+			kind = upstream.ErrSessionDead
+		}
+	}
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
@@ -1788,9 +1901,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     冷却会把一个模型的抖动放大成整池停摆（实测同号换模型立刻可用）。
 		//   - 账号级（其余 429 文案）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
 		modelRateLimited := upstream.IsModelRateLimit(body)
+		// 模型级冷却的 reason 直接存上游原文（不是固定串）：面板要能看出「为什么锁」，
+		// 锁池命中时客户端也要拿到上游话术（6004「使用量已超出频率限制，将在 … 重置」）。
+		// 账号级冷却仍用下面的固定文案（那是"这个号被限流"，与模型无关）。
+		modelReason := "model rate limit"
+		if s := strings.TrimSpace(body); s != "" {
+			modelReason = s
+		}
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if modelRateLimited {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "model rate limit")
+				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, modelReason)
 				return
 			}
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
@@ -1803,7 +1923,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			retryAfter = time.Now().Add(uerr.RetryAfter)
 		}
 		if modelRateLimited {
-			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, "model rate limit")
+			// 14003 是「模型繁忙」：没有恢复时刻，上游文案就是让客户端换模型/稍后
+			// 重试，不是这个号被限流。给独立短窗口（10s 起、封顶 1m），不套 soft_rate
+			// 的 600s→2h 阶梯，否则一次抖动就是十分钟不可用。
+			if retryAfter.IsZero() && upstream.IsModelBusy(body) {
+				h.cfg.Pool.CooldownModelBusy(uid, model, "14003 model busy")
+				return
+			}
+			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, modelReason)
 			return
 		}
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
@@ -1825,7 +1952,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 与保活 / 预刷新同口径：连续 sessionDeadThreshold 次才禁用。单次 12153
+		// 多为网络抖动或刷新竞态（并发刷新消费了同一个一次性 RT），一次就 Disable
+		// 会把健康账号误踢成「掉登录」。
+		if h.cfg.Pool.NoteSessionDead(uid) {
+			log.Printf("ERR: [server] 连续 %d 次 session dead — 禁用 %s",
+				pool.SessionDeadThreshold(), logfmt.Label(uid, ""))
+		}
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
@@ -1939,6 +2072,83 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 			"gateway_hint": hint,
 		},
 	})
+}
+
+// maxRetryAfterSec Retry-After 上报上限（秒，10 分钟）。客户端普遍把该头当成
+// 「睡多久」的指令（codebuddy CLI 直接 delayMs = retry-after×1000，不设上限），
+// 把几十分钟的冷却原样报出去等于让客户端静默挂起；超过上限按上限报，到点重试
+// 再拿一次 503 即可（只是选号失败，不打上游）。
+const maxRetryAfterSec = 600
+
+// modelBlockIsTransient 判断模型级冷却的原因是「暂时忙/被限流」还是「确定性拒绝」。
+//
+// 依据是写冷却时存下的 Reason 原文（pool.CooldownModelBusy / CooldownSoftForModel
+// 写入，来源就是上游 body）：
+//   - 瞬时（可重试）：14003「模型繁忙」、6004「模型限流」；
+//   - 确定性（换模型才有效）：11102「该后端无此模型」、11158「号型不允许」。
+//
+// 6004/6000 的用量配额在调用点已先被 modelBlockAllQuota 判成不可重试，这里保留
+// 6004 标记只作兜底（如 6004 与 11102 混锁）。
+//
+// 两者此前都回 400 model_unavailable，等于把高峰期的一次忙判成「模型永久不可用」，
+// 客户端据此不重试——官方客户端同一时刻还在 /v2/chat/queue/status 排队（issue #24）。
+func modelBlockIsTransient(reason string) bool {
+	s := strings.ToLower(reason)
+	if s == "" {
+		return false
+	}
+	for _, marker := range []string{"14003", "6004", "model busy", "model rate limit", "rate limit"} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// modelBlockAllQuota 报告「全池该模型被挡」是否清一色是「用量配额」型：上游 6004/6000
+// 明说用量已超出频率限制、将在某时刻重置。这类锁在重置前重试必然同样失败，客户端
+// 该立刻报错（换模型/等额度），而不是像 14003 那样等着重试。
+//
+// 判据复用 upstream 既有分类：IsModelRateLimit 命中 6004/14003/6000，IsModelBusy
+// 只认 14003——「是模型级限流、但不是瞬时繁忙」即用量配额。锁因不是上游原文
+// （如本地标记串）时不认，保持旧的兜底行为。
+func modelBlockAllQuota(blk pool.ModelBlockStatus) bool {
+	if !blk.Blocked || len(blk.Reasons) == 0 {
+		return false
+	}
+	for _, r := range blk.Reasons {
+		if !upstream.IsModelRateLimit(r) || upstream.IsModelBusy(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// modelQuotaCode 返回锁因里的用量配额业务码：6000（kimi 系「用量频率限制」，
+// 带换模型提示）与 6004（「使用量已超出频率限制」）同族不同码，按原文区分。
+// 两者都是 modelBlockAllQuota 认可的形态，识别不到时按 6004 兜底。
+func modelQuotaCode(reason string) int {
+	if upstream.HasCodeMarker(reason, "6000") {
+		return 6000
+	}
+	return 6004
+}
+
+// writeModelQuotaError 全池该模型用量配额耗尽（6004/6000）专用响应：429 + 上游业务码。
+// code 用**数字**是刻意的：客户端是按数字业务码判「能不能重试」的（codebuddy CLI
+// 对 429 只重试 14003/6001/6002/6005/6006 这类瞬时速率码，6004 直接在黑名单外），
+// 写成 "insufficient_quota" 字符串会让它既认不出配额也认不出业务码。
+// type 仍标 insufficient_quota：OpenAI 口径里这就是「别重试，去等额度」。
+func writeModelQuotaError(w http.ResponseWriter, code int, msg, hint string) {
+	e := map[string]any{
+		"message": msg,
+		"type":    "insufficient_quota",
+		"code":    code,
+	}
+	if hint != "" {
+		e["gateway_hint"] = hint
+	}
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": e})
 }
 
 // hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态

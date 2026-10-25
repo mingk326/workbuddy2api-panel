@@ -734,6 +734,14 @@ func (s *Scheduler) runKeepalive(scheduled bool) {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
+				// refresh token 失效 ≠ 账号不可用（issue #83）：AT 未过期时上游 chat
+				// 仍正常。这种号计死会在连续 3 轮保活后永久禁用一个完全健康的账号
+				//（面板一片橙色「疑似登录失效」，对话却秒回）。
+				if upstream.SessionDeadButUsable(a) {
+					log.Printf("keepalive %s: refresh 判死但 AT 仍有效（会话仍可用），不计 session dead",
+						logfmt.Label(st.UID, st.Nickname))
+					continue
+				}
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
 					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
@@ -829,6 +837,12 @@ func (s *Scheduler) noteBalanceAuthFailure(a *auth.Auth, uid string, probeErr er
 	}
 	var re *upstream.Error
 	if errors.As(rerr, &re) && re.Kind == upstream.ErrSessionDead {
+		// refresh token 失效 ≠ 账号不可用（issue #83）：AT 未过期时上游 chat / billing
+		// 仍可能正常。这种号计死会在 3 次探测后永久禁用一个健康账号。
+		if upstream.SessionDeadButUsable(a) {
+			log.Printf("balance %s: refresh 判死但 AT 仍有效（会话仍可用），不计 session dead", label)
+			return
+		}
 		if s.cfg.Pool.NoteSessionDead(uid) {
 			log.Printf("balance %s: 连续 %d 次 401 且 refresh 判死 — 禁用（需重新登录）", label, pool.SessionDeadThreshold())
 			return
