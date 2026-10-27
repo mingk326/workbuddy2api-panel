@@ -344,7 +344,18 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+# anthropic_messages（Claude Code / Anthropic SDK 原生协议，无需中间层翻译）
+# 客户端侧把 ANTHROPIC_BASE_URL 指到网关根（SDK 自己拼 /v1/messages）；
+# api_key 非空时两种鉴权头都认，选其一即可。
+curl -s http://localhost:7863/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
+
+`POST /v1/messages/count_tokens` **未实现**（404）：Claude Code 的上下文预算估算会退回本地字符估算，功能不受影响，但别把它当成网关故障。
 
 ## 配置说明
 
@@ -362,12 +373,14 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_keys[].daily_request_limit` | `0` | **每日模型请求数上限**（CST 自然日）：通过配额检查时 +1，被上游拒绝的请求也计入；`0` = 不限制。旧版 `config.api_key` 不参与配额 |
 | `api_keys[].rpm_limit` | `0` | **每分钟请求数上限**（滑动 60 秒窗口，含 chat / messages / responses 与出图）：超限返回 429 `rate_limit_exceeded` + `Retry-After`（窗口腾出的秒数），不选号、不打上游；`0` = 不限制。只统计通过准入的客户端请求，被拒请求不消耗日请求数；窗口在内存中维护，重启清零 |
 | `api_keys[].max_concurrency` | `0` | **同时在途请求上限**（流式请求到最后一帧才算结束，含出图）：超限返回 429 `rate_limit_exceeded` + `Retry-After: 1`；`0` = 不限制。建议所有密钥的并发上限之和不超过账号数，避免互相抢号 |
+| `models.allowed` | `[]` | **全局模型白名单**：非空时只放行列表内模型（裸名两域、`cn:` / `global:` 只该域），`GET /v1/models` 不列、chat / 出图点名调用直接 400 `model_unavailable`；空 = 不启用。与 `models.hidden` 是交集语义（白名单先圈范围、黑名单再剔除）；保存后热生效 |
 | `models.hidden` | `[]` | **全局模型黑名单**：裸名（`glm-5.2`）对 cn/global 两个域都隐藏，`cn:` / `global:` 前缀只隐藏该域。`GET /v1/models` 不列、chat / 出图点名调用直接 400 `model_unavailable`（知道名字也调不到）；保存后热生效 |
 | `models.aliases` | `[]` | **模型映射**（`["claude-opus-4=glm-5.2"]`）：键大小写不敏感，裸名键两域生效，`cn:` / `global:` 前缀键只在该域生效，值可带前缀跨域指向。映射在黑名单检查**之前**完成（别名不能绕过 `models.hidden`）；出站/选号/粘性/账本用真实名，响应 `model` 回显客户端原发名；保存后热生效 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
+| `panel.poll_interval_sec` | `0` | 面板自动刷新间隔（秒）：`0` = 前端缺省 5 秒；负值 = 关闭自动刷新（仅手动更新）。页面切到后台时自动暂停轮询 |
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
 | `logging.request_retention_days` | `7` | 请求归档保留天数；超期文件在启动和周期清理时删除 |
 | `logging.request_archive_max_mb` | `100` | 请求归档总容量上限（MiB）；超限优先删除最旧文件 |
@@ -657,7 +670,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 ## API 端点
 
-**余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
+**余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。`schedule.balance_refresh_jitter_permill` / `schedule.task_sweep_jitter_permill`（0–500）给周期任务加 ±N‰ 随机抖动并把账号遍历摊开；`schedule.night_account_cap`（0 = 不限）把夜猫子任务的参与账号收窄为积分最高的前 N 个——都是降低「全池整点齐射」的机器人指纹。
 
 ## 🖥️ Web 管理面板
 
@@ -724,7 +737,7 @@ http://127.0.0.1:7863/panel/
 
 **鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
 
-**防爆破锁定**：面板鉴权失败**一次**即按客户端 IP 锁定 **1 小时**；锁定期内即使携带正确密钥也返回 `429`（`error: too_many_attempts`，`Retry-After` 为剩余秒数），避免锁定期间继续试探。客户端 IP 依次取 `CF-Connecting-IP` → `X-Real-IP` → `X-Forwarded-For` 首段 → TCP 对端；锁定状态仅存内存，进程重启即清空。注意这些请求头可被伪造，公网直连时换头即可绕过锁定——请始终置于反向代理/隧道之后并限制来源。
+**鉴权失败处理**：面板鉴权失败只记一行日志并返回 `401`，不再按 IP 锁定（1.18.0 起移除「输错一次锁 1 小时」策略，避免误输/换网络后把自己锁在门外）。公网部署请依赖反向代理的限流与 HTTPS。
 
 > ⚠️ 公网部署提示：服务自身只提供明文 HTTP，**请务必置于 HTTPS 反向代理之后**（Nginx/Caddy 等）并配置访问限流；仅本机或私有网络使用时可直接运行。
 

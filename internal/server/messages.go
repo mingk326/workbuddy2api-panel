@@ -24,6 +24,42 @@ import (
 	"strings"
 )
 
+// withDualAuth 同时接受 Bearer 与 Anthropic 的 x-api-key 两种携带方式。
+//
+// 存在的理由：GET /v1/models 是双协议共用端点。Anthropic 官方 SDK 用 x-api-key
+// 认证（与 POST /v1/messages 一致），OpenAI 系客户端用 Authorization: Bearer；
+// 此前该端点只挂 withAuth，Anthropic 侧的模型发现必然 401——同一份 API Key
+// 能调通 /v1/messages 却列不出模型，属路由挂载的对称性缺失而非设计取舍。
+//
+// 错误形状按请求方选：带 x-api-key 或 anthropic-version 的按 Anthropic 口径回
+// （type: error / error.type: authentication_error），否则维持 OpenAI 口径
+// （error.type: api_error / error.code: invalid_api_key），两类 SDK 都能正确解析。
+// 鉴权走 h.authenticate（多密钥表），与 withAuth / withAnthropicAuth 同一入口。
+func (h *Handler) withDualAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		anthropic := r.Header.Get("x-api-key") != "" || r.Header.Get("anthropic-version") != ""
+		// Anthropic 侧：空 Authorization 时把 x-api-key 提升到标准头，复用同一套比较。
+		if r.Header.Get("Authorization") == "" {
+			if k := r.Header.Get("x-api-key"); k != "" {
+				r.Header.Set("Authorization", "Bearer "+k)
+			}
+		}
+		if key, ok := h.authenticate(r); !ok {
+			if anthropic {
+				writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
+				return
+			}
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		} else {
+			// 与 withAuth 同口径：密钥身份必须进上下文，否则密钥级模型白名单
+			// （authKeyFrom）会把受限密钥当成无限制。
+			noteTraceKey(r, key)
+			next(w, withAuthKey(r, key))
+		}
+	}
+}
+
 // withAnthropicAuth Anthropic 风格鉴权：官方 SDK 用 x-api-key 而不是 Bearer。
 // 空 Authorization 时把 x-api-key 提升成 Bearer，再走同一套常量时间比较。
 func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {

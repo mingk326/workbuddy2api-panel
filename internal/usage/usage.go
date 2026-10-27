@@ -85,6 +85,11 @@ type Recorder struct {
 	dirty   bool
 	started time.Time
 
+	// 落盘失败观测（进 Snapshot，面板可见「用量文件已 N 轮没写成功」）：
+	// 失败计数 + 最近一次错误。dirty 在失败后立即置回 true，等下个 tick 重试。
+	lastErr       string
+	failedFlushes int
+
 	stopOnce sync.Once
 	stop     chan struct{}
 	done     chan struct{}
@@ -324,21 +329,33 @@ func (r *Recorder) flush(force bool) {
 
 	raw, err := json.Marshal(snap)
 	if err != nil {
-		log.Printf("[usage] 序列化失败: %v", err)
+		r.noteFlushFailure("序列化失败", err)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
-		log.Printf("[usage] 建目录失败: %v", err)
+		r.noteFlushFailure("建目录失败", err)
 		return
 	}
 	tmp := r.path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("[usage] 写临时文件失败: %v", err)
+		r.noteFlushFailure("写临时文件失败", err)
 		return
 	}
 	if err := os.Rename(tmp, r.path); err != nil {
-		log.Printf("[usage] 原子替换失败: %v", err)
+		r.noteFlushFailure("原子替换失败", err)
 	}
+}
+
+// noteFlushFailure 记一次落盘失败并恢复 dirty：此前 dirty 在写盘前就被清掉且
+// 失败不恢复——若无新请求进来，后续每轮 flush 都直接跳过，改动只能等下一次
+// Add 或进程退出兜底，期间进程崩溃即丢一个防抖周期的数据。
+func (r *Recorder) noteFlushFailure(stage string, err error) {
+	log.Printf("[usage] %s: %v", stage, err)
+	r.mu.Lock()
+	r.dirty = true
+	r.lastErr = stage + ": " + err.Error()
+	r.failedFlushes++
+	r.mu.Unlock()
 }
 
 // Save 立即落盘（面板「刷新」或关闭前调用）。
@@ -482,6 +499,10 @@ type Snapshot struct {
 	WindowFrom string `json:"window_from,omitempty"`
 	WindowTo   string `json:"window_to,omitempty"`
 	Generated  string `json:"generated"`
+	// LastError/FailedFlushes 落盘健康观测：失败计数与最近一次错误（面板可显示
+	// 「用量文件已 N 轮没写成功」）；零值省略，健康时不出现。
+	LastError     string `json:"last_error,omitempty"`
+	FailedFlushes int    `json:"failed_flushes,omitempty"`
 }
 
 // Window 用量统计窗口。三种口径按优先级解析（见 bounds）：
@@ -563,6 +584,7 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	for _, b := range r.buckets {
 		bs = append(bs, *b)
 	}
+	lastErr, failedFlushes := r.lastErr, r.failedFlushes
 	r.mu.Unlock()
 
 	var total aggAcc
@@ -680,6 +702,8 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		CreditByModel:   creditKeyed(creditModelAgg),
 		Buckets:         matched,
 		Generated:       time.Now().Format(time.RFC3339),
+		LastError:       lastErr,
+		FailedFlushes:   failedFlushes,
 	}
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]

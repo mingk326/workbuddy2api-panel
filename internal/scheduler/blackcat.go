@@ -24,7 +24,11 @@ func (s *Scheduler) RunBlackcatNow() {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
 	}
-	for _, st := range s.cfg.Pool.List() {
+	// 夜间参与上限（schedule.night_account_cap）：夜猫子是全任务体系里唯一「整任务
+	// 都是真实模型对话」的，指纹最重——深夜全池同 IP 齐做真实对话是最好认的机器人
+	// 形状。>0 时候选收窄为积分最高的前 N 个（夜间流量集中到少数号，其余号夜里
+	// 静默）；0 = 不限（旧行为全池参加）。
+	for _, st := range capByCredits(s.cfg.Pool.List(), s.NightAccountCap()) {
 		// 暂停选号（paused）账号跳过：夜猫子是全任务体系中唯一「整任务都是
 		// 真实模型对话」的（RunNightChats 逐条 ChatStream 发 glm-5.2 短对话），
 		// 与「让位防风控」正面冲突。旅行/成长任务都是纯上报或领奖 RPC，照常跑。

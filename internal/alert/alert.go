@@ -206,6 +206,10 @@ type RealmSnapshot struct {
 	Cooling  int `json:"cooling"`
 	Disabled int `json:"disabled"`
 	Breaker  int `json:"breaker"`
+	// Degraded 连败降权中的账号数。alert.Health 一直有这个观测，但快照转换时
+	// 被丢弃——webhook 接收方永远看不到「有一批号在连败降权」，只能等它恶化成
+	// healthy 不足才被 realm_healthy_low 告警。
+	Degraded int `json:"degraded"`
 	InFlight int `json:"in_flight"`
 }
 
@@ -321,7 +325,7 @@ func (m *Monitor) Tick(now time.Time) {
 func (m *Monitor) snapshot() Snapshot {
 	to := func(h Health) RealmSnapshot {
 		return RealmSnapshot{Total: h.Total, Healthy: h.Healthy, Cooling: h.Cooling,
-			Disabled: h.Disabled, Breaker: h.Breaker, InFlight: h.InFlight}
+			Disabled: h.Disabled, Breaker: h.Breaker, Degraded: h.Degraded, InFlight: h.InFlight}
 	}
 	return Snapshot{CN: to(m.src.Health("cn")), Global: to(m.src.Health("global")), WAFActive: m.src.WAFActive()}
 }

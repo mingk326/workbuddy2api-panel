@@ -112,6 +112,16 @@ type Scheduler struct {
 	// SetTaskSweepInterval 可热改（面板保存配置后下一轮生效）。
 	sweepInterval atomic.Int64
 
+	// balanceJitter/sweepJitter 周期抖动比例（千分比 0-500 = 0-50%，atomic 读写）。
+	// >0 时余额刷新/补领清扫的下一轮间隔在 ±frac×interval 内随机偏移（见 humanize.go），
+	// 不再精确固定间隔打卡。余额刷新另把账号遍历摊开（spreadStaggerDelay）。
+	balanceJitter atomic.Int64
+	sweepJitter   atomic.Int64
+
+	// nightAccountCap 夜间任务参与上限（>0 = 只让积分最高的前 N 个号参加夜猫子）。
+	// atomic 读写，Reconfigure 可热改。0 = 不限（旧行为）。
+	nightAccountCap atomic.Int64
+
 	// authHealMu/authHealAt 401→refresh 求证的退避记账（uid → 上次求证时刻）。
 	// 见 allowAuthHeal：降级 token 会让每轮探测都 401，不设退避就是每 5 分钟轮换一次 RT。
 	authHealMu sync.Mutex
@@ -766,6 +776,10 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	// 账号级起跑错峰（人味化，humanize.go）：并发齐射改为窗口内逐号错开，消除
+	// 「同一秒全池同动作」的时间指纹。窗口量级 = frac×interval（周期抖动关闭时为 0
+	// = 旧行为全并发）；偏移逐号、逐轮独立。手动全量刷新也走这里。
+	stagger := spreadIntervalStagger(time.Duration(s.balanceInterval.Load()), s.periodicJitterFor(false))
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -775,8 +789,11 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			continue
 		}
 		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
+		go func(a *auth.Auth, uid string, wait time.Duration) {
 			defer wg.Done()
+			if wait > 0 && !sleepCtx(context.Background(), wait) {
+				return
+			}
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
@@ -786,7 +803,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 			s.cfg.CreditHist.Observe(uid, remain)
-		}(a, st.UID)
+		}(a, st.UID, spreadStaggerDelay(stagger, st.UID))
 	}
 	wg.Wait()
 }
@@ -881,7 +898,13 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			// 人味化抖动：间隔在 ±frac×interval 内偏移（每轮重取，进程种子稳定），
+			// 不再精确固定间隔打卡。基准间隔不变（热改/暂停语义不受影响）。
+			delay := cur + periodicJitter(cur, s.periodicJitterFor(false), "bal")
+			if delay < 0 {
+				delay = 0
+			}
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -936,7 +959,13 @@ func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) 
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			// 人味化抖动：间隔在 ±frac×interval 内偏移（每轮重取），不再精确固定
+			// 间隔打卡。基准间隔不变（热改/暂停语义不受影响）。见 humanize.go。
+			delay := cur + periodicJitter(cur, s.periodicJitterFor(true), "sweep")
+			if delay < 0 {
+				delay = 0
+			}
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -980,4 +1009,50 @@ func (s *Scheduler) SetTaskSweepInterval(d time.Duration) {
 	}
 	s.sweepInterval.Store(int64(d))
 	poke(s.rearmSweep)
+}
+
+// SetJitter 热改周期抖动比例（千分比；<=0 关闭）。balance 与 sweep 各自独立。
+func (s *Scheduler) SetJitter(balancePermill, sweepPermill int) {
+	if balancePermill < 0 {
+		balancePermill = 0
+	}
+	if sweepPermill < 0 {
+		sweepPermill = 0
+	}
+	s.balanceJitter.Store(int64(balancePermill))
+	s.sweepJitter.Store(int64(sweepPermill))
+}
+
+// SetNightAccountCap 热改夜间参与上限；<0 视为 0（不限）。
+func (s *Scheduler) SetNightAccountCap(n int) {
+	if n < 0 {
+		n = 0
+	}
+	s.nightAccountCap.Store(int64(n))
+}
+
+// NightAccountCap 当前夜间参与上限。
+func (s *Scheduler) NightAccountCap() int { return int(s.nightAccountCap.Load()) }
+
+// capByCredits 夜间任务候选收窄：按积分降序取前 cap 个（余额未知/相同的顺序不稳定，
+// 但候选集每天基本不变，无需额外确定性）。cap<=0 或候选不超上限时原样返回。
+func capByCredits(list []pool.Status, cap int) []pool.Status {
+	if cap <= 0 || len(list) <= cap {
+		return list
+	}
+	sorted := append([]pool.Status(nil), list...)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].Credits > sorted[j-1].Credits; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	return sorted[:cap]
+}
+
+// periodicJitterFor 当前生效的周期抖动（千分比 → 比例）。
+func (s *Scheduler) periodicJitterFor(sweep bool) float64 {
+	if sweep {
+		return float64(s.sweepJitter.Load()) / 1000
+	}
+	return float64(s.balanceJitter.Load()) / 1000
 }

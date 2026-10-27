@@ -10,10 +10,12 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,7 +35,33 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.16.3-panel"
+const appVersion = "1.18.0-panel"
+
+// insecureKeyWarning 空 api_key = 完全不鉴权（httpauth 对空 key 恒放行），
+// 样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（缺省 ":7863" 绑
+// 所有网卡）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动
+// 日志打印，安全状态返回空串。首启自动生成的随机 key 不会命中——这是给
+// 「照抄样例 / 显式清空」的最后提醒，不阻塞启动。
+func insecureKeyWarning(listen, apiKey string) string {
+	if apiKey != "" && apiKey != "test_key" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		host = listen // 非 host:port 形态：按具名地址保守处理（继续告警）
+	}
+	switch {
+	case host == "", host == "0.0.0.0", host == "::":
+		// 空 host = 所有网卡，维持告警
+	case host == "127.0.0.1", host == "::1", strings.EqualFold(host, "localhost"):
+		return "" // 只听回环：暴露面有限，不打扰
+	}
+	what := "为空（网关与面板完全不鉴权）"
+	if apiKey != "" {
+		what = "为样例占位符 test_key"
+	}
+	return fmt.Sprintf("api_key %s，且监听 %s 非回环地址——对外无有效鉴权，请尽快修改配置里的 api_key", what, listen)
+}
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -260,11 +288,14 @@ func main() {
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	allowedModels, allowlistEnabled := livecfg.NormalizeAllowedModels(cfg.Models.Allowed)
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
 		APIKeys:              cfg.EffectiveKeys(),
 		ModelFallback:        cfg.Pool.ModelFallback,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		AllowedModels:        allowedModels,
+		AllowlistEnabled:     allowlistEnabled,
 		ModelAliases:         livecfg.NormalizeModelAliases(cfg.Models.Aliases),
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
@@ -313,7 +344,9 @@ func main() {
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
-		Live:        live,
+		// 面板自动刷新间隔（秒）：0 = 前端缺省 5s，负值 = 关闭自动刷新。
+		PollIntervalSec: cfg.Panel.PollIntervalSec,
+		Live:            live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -332,6 +365,16 @@ func main() {
 	// 任务奖励领掉。成长队列跑的是行为链路（贵、一天一次），清扫几乎零负担故可高频；
 	// hook 已挂载、循环由 StartTaskSweep 按 interval 启动（关闭时 interval=0 → 不启动）。
 	sch.SetTaskSweepHook(func() { pn.RunTaskSweepOnce() })
+	// 周期任务人味化：余额刷新/清扫抖动 + 夜猫子 Top-N 参与上限（0 = 旧行为）。
+	sch.SetJitter(cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
+	sch.SetNightAccountCap(cfg.Schedule.NightAccountCap)
+	if cfg.Schedule.BalanceRefreshJitterPermill > 0 || cfg.Schedule.TaskSweepJitterPermill > 0 {
+		log.Printf("周期任务抖动：余额刷新 ±%d‰ / 补领清扫 ±%d‰（0 = 关闭）",
+			cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
+	}
+	if cfg.Schedule.NightAccountCap > 0 {
+		log.Printf("夜间参与上限：夜猫子只让积分最高的前 %d 个号参加（schedule.night_account_cap）", cfg.Schedule.NightAccountCap)
+	}
 	switch {
 	case !cfg.Schedule.TaskSweepEnabled:
 		log.Printf("任务补领清扫已禁用（schedule.task_sweep_enabled=false）")
@@ -421,13 +464,25 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 在途请求排干窗口可配（server.shutdown_timeout，缺省 30s）：长流式 SSE
+		// 合法时长可达分钟级，固定 5s 必然把在途请求掐成连接重置；超时不再静默。
+		shutdownTimeout := cfg.ShutdownTimeoutDur
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = 5 * time.Second
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("WARN: 优雅关停未在 %s 内完成，在途请求被放弃: %v", shutdownTimeout, err)
+		}
 	}()
 
+	if warn := insecureKeyWarning(cfg.Listen, cfg.APIKey); warn != "" {
+		log.Printf("WARN: %s", warn)
+	}
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		p.Flush() // 监听失败时信号路径不会跑：这里同样兜底落盘再退
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
@@ -557,11 +612,14 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
+	newAllowed, newAllowlist := livecfg.NormalizeAllowedModels(newCfg.Models.Allowed)
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
 		APIKeys:              newCfg.EffectiveKeys(),
 		ModelFallback:        newCfg.Pool.ModelFallback,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		AllowedModels:        newAllowed,
+		AllowlistEnabled:     newAllowlist,
 		ModelAliases:         livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
@@ -600,6 +658,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	// 账号级摊开热生效：下一轮排程任务即按新窗口执行（0 = 关闭）。
 	sch.SetAccountSpread(newCfg.Schedule.AccountSpreadMinutes, newCfg.Schedule.AccountSpreadMinGapSeconds)
+	sch.SetJitter(newCfg.Schedule.BalanceRefreshJitterPermill, newCfg.Schedule.TaskSweepJitterPermill)
+	sch.SetNightAccountCap(newCfg.Schedule.NightAccountCap)
 
 	return restartRequiredFields(newCfg), nil
 }
@@ -628,7 +688,7 @@ func restartRequiredFields(c *Config) []string {
 	}
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
-	out = append(out, "server.read_timeout")
+	out = append(out, "server.read_timeout", "server.shutdown_timeout")
 	return out
 }
 

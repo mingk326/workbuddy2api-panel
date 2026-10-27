@@ -21,9 +21,27 @@ import (
 var errEmptyStream = errors.New("upstream stream contained no valid data events")
 
 // IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
-// 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
-// upstream_parse 同语义），与客户端断连类错误区分。
+// 在流式路径把空流记为失败观测。**首选是 HeadVetoError**（零字节否决，见下）；
+// 本哨兵只剩「注释/心跳行已写出、响应头已提交之后才是空流」这一种形态可达。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
+
+// HeadVetoError 首帧否决：网关向客户端写出第一个字节**之前**，上游第一帧就是
+// error 帧（6004 限流 / 审核 / 会话失效），或干脆一个有效帧都没有。
+//
+// 为什么单独成一类：这一帧不是「已开流的失败」，整次尝试对客户端无痕——调用方
+// 可以照常换号重试，客户端最终拿到别的号的成功响应，而不是「HTTP 200 + error
+// 帧」（SSE 一旦发过字节就无法改状态码，此前只能这么兜底）。
+//
+// Payload 是 error 帧原文（空串 = 零有效帧），供调用方按分类处置账号，并在轮转
+// 全败时把原文透传给客户端。
+type HeadVetoError struct{ Payload string }
+
+func (e *HeadVetoError) Error() string {
+	if e.Payload == "" {
+		return "upstream produced no frame before head commit"
+	}
+	return "upstream error frame before head commit: " + e.Payload
+}
 
 // TruncationFinishReason 上游没有给出正常收尾时（既无 finish_reason 也无
 // data: [DONE] 就 EOF = 断流）如实上报的截断终态取值。
@@ -608,11 +626,13 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// 客户端没声明过 tools 时 repair.Enabled() 为 false → 整条流零改写零分配。
 	//   - synthIdx：本流已还原的调用数（合成的 index 从上游最大 index 之后接续）；
 	//   - maxToolIdx：上游已用过的最大 tool_call index，避免合成的 index 与真实调用撞车；
-	//   - toolFinishSent：是否已发出过 finish_reason: tool_calls，供流尾兜底。
+	//   - toolFinishSent：是否已发出过 finish_reason: tool_calls，供流尾兜底；
+	//   - finishSeen：本流是否已向客户端写出过任一终态帧（finish_reason 非空）。
 	repair := o.markup
 	synthIdx := 0
 	maxToolIdx := -1
 	toolFinishSent := false
+	finishSeen := false
 
 	// writeSSE 原样写出一帧并 flush。
 	writeSSE := func(payload string) error {
@@ -664,6 +684,11 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				if c == nil {
 					continue
 				}
+				// 终态记账：任何带非空 finish_reason 的帧都算「客户端已收到终态」
+				// （含 continue 层合成的 length 截断终态——它同样经此处透传）。
+				if fr, _ := c["finish_reason"].(string); fr != "" {
+					finishSeen = true
+				}
 				d, _ := c["delta"].(map[string]any)
 				if d == nil {
 					continue
@@ -691,7 +716,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// 后的可见文本）+ N 个 delta.tool_calls 帧 + 收尾 finish_reason 帧。没有命中标记
 	// 时原样返回入参帧（单元素），与修复前逐字节一致。
 	repairFrame := func(obj map[string]any) []map[string]any {
-		if !repair.Enabled() {
+		if repair == nil || !repair.Enabled() {
 			return []map[string]any{obj}
 		}
 		chs, ok := obj["choices"].([]any)
@@ -798,6 +823,10 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+	// headOpen 首帧否决窗口：尚未向客户端写出任何字节。窗口内遇到上游 error 帧
+	// （或整个流零有效帧）就返回 HeadVetoError 而不写字节——上层据此换号重试，
+	// 客户端看不到这次失败（见 HeadVetoError）。
+	headOpen := true
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -808,13 +837,36 @@ readLoop:
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
 			break readLoop
 		case strings.HasPrefix(trimmed, "data: "):
-			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
+			payload := strings.TrimPrefix(trimmed, "data: ")
+			if headOpen {
+				headOpen = false
+				// 带 error 键的帧即上游 error-passthrough 形态（判据同 writeFrame）：
+				// 它不含可用正文，换号重试对客户端无痕。
+				var probe map[string]any
+				if json.Unmarshal([]byte(payload), &probe) == nil {
+					if _, hasErr := probe["error"]; hasErr {
+						return &HeadVetoError{Payload: payload}
+					}
+					// 流内失败帧（HTTP 200 内嵌顶层 {code,msg}，无 choices；判据同
+					// writeFrame 的 StreamErrorFrame）：首帧即失败同样否决换号——否则
+					// 响应头一旦提交，可重试的失败（11140 审核拦截、6021 队列满）就只能
+					// 以「200 + error 帧」透给客户端。payload 改写成标准 error 帧后再带出，
+					// FrameKind 与末端错误映射的口径和 writeFrame 的透出形态一致。
+					if code, msg, ok := StreamErrorFrame(probe); ok {
+						return &HeadVetoError{Payload: streamErrorPayload(code, msg, payload)}
+					}
+				}
+			}
+			n, werr := writeFrame(payload)
 			validFrames += n
 			if werr != nil {
 				return werr
 			}
 		case trimmed != "":
 			// 注释/其他行：原样透传
+			// shortcut: 这一行就提交了响应头，首帧否决窗口随之关闭（首帧即注释的
+			// 形态罕见，不为此缓冲整段头部）。
+			headOpen = false
 			if _, werr := io.WriteString(w, line); werr != nil {
 				return werr
 			}
@@ -833,7 +885,7 @@ readLoop:
 	// 标记修复的尾部收尾：流结束时仍未判定的字节一律原文回吐（绝不吞字节，未闭合
 	// 的块连起始标记一起交还）；若本流还原过调用、但上游从未给出收尾帧，补一帧
 	// finish_reason: tool_calls，保证客户端不会把「工具调用回合」读成「模型只说了话」。
-	if repair.Enabled() {
+	if repair != nil && repair.Enabled() {
 		if tail := repair.Flush(); tail != "" {
 			tailObj := map[string]any{
 				"object": "chat.completion.chunk",
@@ -847,17 +899,25 @@ readLoop:
 			}
 			validFrames++
 		}
-		if synthIdx > 0 && !toolFinishSent {
+		// 只在「本流一个终态都没发过」时兜底：补了就是一条流两个 finish_reason，
+		// 而后一个会把前一个洗掉——最典型是 continue 层刚补的 length 截断终态被
+		// 后补的 tool_calls 覆盖，客户端把中断的回合读成正常收尾。
+		if synthIdx > 0 && !toolFinishSent && !finishSeen {
 			if werr := writeChunk(finishOnlyFrame(map[string]any{}, "tool_calls"), ""); werr != nil {
 				return werr
 			}
 		}
 	}
-	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
-	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
+	// 空流（0 有效帧）：尚未写出任何字节时先走首帧否决（上层换号比补一帧假成功的
+	// error 更有价值）；已经写过注释/心跳行（响应头已提交）则只能照旧兜底——先写一帧
+	// error（绕过 normalizeFrame 原样保留 error 字段），再补 [DONE] 保证客户端能正常
+	// 收尾，并返回非 nil error 供调用方记录。
 	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
 	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
 	if validFrames == 0 {
+		if headOpen {
+			return &HeadVetoError{}
+		}
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。

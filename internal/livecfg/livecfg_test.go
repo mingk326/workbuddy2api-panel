@@ -22,6 +22,28 @@ func TestNormalizeHiddenModels(t *testing.T) {
 	}
 }
 
+// TestNormalizeAllowedModels 白名单归一化与 Hidden 对称；空输入/全空白 → 未启用。
+func TestNormalizeAllowedModels(t *testing.T) {
+	m, enabled := NormalizeAllowedModels([]string{" glm-5.2 ", "cn:kimi-k3-1"})
+	if !enabled {
+		t.Fatal("enabled=false want true")
+	}
+	for _, k := range []string{"cn:glm-5.2", "global:glm-5.2", "cn:kimi-k3-1"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("missing %q in %v", k, m)
+		}
+	}
+	if _, ok := m["global:kimi-k3-1"]; ok {
+		t.Error("cn: 前缀不应登记 global 键")
+	}
+	if m2, en := NormalizeAllowedModels(nil); m2 != nil || en {
+		t.Errorf("nil → (%v,%v) want (nil,false)", m2, en)
+	}
+	if m3, en := NormalizeAllowedModels([]string{"  ", ""}); m3 != nil || en {
+		t.Errorf("blank → (%v,%v) want (nil,false)", m3, en)
+	}
+}
+
 // TestNormalizeModelAliases 别名归一化：键小写、裸名两域、前缀只该域、自映射丢弃。
 func TestNormalizeModelAliases(t *testing.T) {
 	m := NormalizeModelAliases([]string{

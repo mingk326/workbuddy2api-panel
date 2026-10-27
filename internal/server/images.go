@@ -67,7 +67,8 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		return
 	}
 	model, _ := req["model"].(string)
-	if strings.TrimSpace(model) == "" {
+	named := strings.TrimSpace(model) != "" // 客户端是否显式点名了模型
+	if !named {
 		model = defaultImageModel
 	}
 	realm, bare := resolveModel(model)
@@ -87,6 +88,15 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		st.status = http.StatusBadRequest
 		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
 			model+" 已被网关配置隐藏（models.hidden），请换一个模型")
+		return
+	}
+	// 全局模型白名单（models.allowed，issue #68）：点名模型不在白名单同样 400，
+	// 不打上游、不占选号。未点名时保持网关默认出图模型（管理员配置的默认值），
+	// 不因白名单未列出默认名而把「只说 prompt」的请求整体打死。
+	if named && !h.allowedModel(realm, bare) {
+		st.status = http.StatusBadRequest
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			"model is not in the gateway allowlist, try another model")
 		return
 	}
 	// 密钥级模型白名单：名单外出图模型直接 403（先于下架/路由检查，

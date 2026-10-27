@@ -74,6 +74,10 @@ type Config struct {
 	// 热改走 Live 快照（HiddenModels），本字段只用于未接 Live 的静态路径。
 	ModelsHidden []string
 
+	// ModelsAllowed 模型白名单原始条目（config models.allowed，issue #68；
+	// Live 为 nil 的裸用/测试路径经 loadLive() 归一化后使用）。
+	ModelsAllowed []string
+
 	// ModelsAliases 模型映射原始条目（config models.aliases，"客户端名=真实名"）。
 	// 热改走 Live 快照（ModelAliases），本字段只用于未接 Live 的静态路径。
 	ModelsAliases []string
@@ -172,6 +176,10 @@ type Handler struct {
 
 	// modelsHidden 静态配置下的黑名单集合（Live 快照优先；见 hiddenModel）。
 	modelsHidden map[string]struct{}
+	// modelsAllowed 静态配置下的白名单集合（Live 快照优先；见 allowedModel）。
+	modelsAllowed map[string]struct{}
+	// allowlistEnabled 静态配置下白名单是否启用（与 modelsAllowed 配套）。
+	allowlistEnabled bool
 	// modelAliases 静态配置下的别名表（Live 快照优先；见 modelAlias）。
 	modelAliases map[string]string
 }
@@ -190,12 +198,17 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
+	allowed, allowlistEnabled := livecfg.NormalizeAllowedModels(cfg.ModelsAllowed)
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), budget: newDailyBudget(cfg.BudgetLimit), taskRunning: map[string]bool{},
-		modelsHidden: livecfg.NormalizeHiddenModels(cfg.ModelsHidden),
-		modelAliases: livecfg.NormalizeModelAliases(cfg.ModelsAliases)}
+		modelsHidden:     livecfg.NormalizeHiddenModels(cfg.ModelsHidden),
+		modelsAllowed:    allowed,
+		allowlistEnabled: allowlistEnabled,
+		modelAliases:     livecfg.NormalizeModelAliases(cfg.ModelsAliases)}
 	h.budget.applyConfig(cfg.BudgetLimit, cfg.BudgetBurstLimit, cfg.BudgetCacheLowRate)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	// /v1/models 是双协议共用端点：Anthropic 官方 SDK 用 x-api-key，
+	// OpenAI 系客户端用 Bearer，两种携带方式都必须放行（见 withDualAuth）。
+	h.mux.HandleFunc("GET /v1/models", h.withDualAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
@@ -547,6 +560,31 @@ func (h *Handler) hiddenModel(realm, bare string) bool {
 	return hide
 }
 
+// allowedModel 报告 (realm, 裸模型名) 是否被 config models.allowed 白名单放行（issue #68）。
+//
+// 白名单语义是「不在白名单 = 对本网关不存在」：未启用（空配置/全空条目）恒为
+// true（默认放行全部，向后兼容）；启用时非白名单条目一律 false。四个生效点
+// （cn 对话列表 / global 对话列表 / 出图单列 / chat 与出图入口点名）全部只经由
+// 本谓词——与 hiddenModel 同一单点收敛教训：漏一处判据就等于白名单可被绕过。
+func (h *Handler) allowedModel(realm, bare string) bool {
+	if bare == "" {
+		return false
+	}
+	if h.cfg.Live != nil {
+		snap := h.cfg.Live.Load()
+		if !snap.AllowlistEnabled {
+			return true
+		}
+		_, ok := snap.AllowedModels[realm+":"+bare]
+		return ok
+	}
+	if !h.allowlistEnabled {
+		return true
+	}
+	_, ok := h.modelsAllowed[realm+":"+bare]
+	return ok
+}
+
 // modelAlias 查 models.aliases 映射：返回目标真实模型名（原样，可带 realm 前缀）。
 // 查找键与 livecfg.NormalizeModelAliases 的归一化口径配对：realm+":"+小写裸名。
 func (h *Handler) modelAlias(realm, bare string) (string, bool) {
@@ -568,6 +606,10 @@ func (h *Handler) modelAlias(realm, bare string) (string, bool) {
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
+		// 白名单过滤（issue #68）：启用时不在白名单的模型不进 cn 对话列表。
+		if !h.allowedModel("cn", mi.ID) {
+			continue
+		}
 		if h.hiddenModel("cn", mi.ID) {
 			continue
 		}
@@ -614,6 +656,10 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
+			// 白名单过滤（issue #68）：global 列表与 cn 同判据。
+			if !h.allowedModel("global", id) {
+				continue
+			}
 			if h.hiddenModel("global", id) {
 				continue
 			}
@@ -817,6 +863,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.status = http.StatusBadRequest
 		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
 			peek.Model+" 已被网关配置隐藏（models.hidden），请换一个模型")
+		return
+	}
+	// 全局模型白名单（models.allowed，issue #68）：别名映射之后、密钥白名单之前——
+	// 别名解析出的真实目标同样受检，不能绕过白名单（与 hidden 同一条不变量）。
+	// 文案不区分「不存在」与「未在白名单」，避免枚举探测。
+	if !h.allowedModel(realm, bareModel) {
+		st.status = http.StatusBadRequest
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			"model is not in the gateway allowlist, try another model")
 		return
 	}
 	// 密钥白名单按「真实模型」判定；若管理员显式把客户端别名写进白名单，
@@ -1424,6 +1479,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
 				upstream.WithMarkupRepair(repair),
 				upstream.WithModelEcho(modelEcho))
+			// 首帧否决（见 upstream.HeadVetoError）：网关一个字节都没写出，这次尝试对
+			// 客户端完全无痕——按错误类型处置账号后换号，而不是把「HTTP 200 + error 帧」
+			// 透给客户端（SSE 发过字节就改不了状态码，此前只能这么兜底）。
+			var hv *upstream.HeadVetoError
+			if errors.As(sErr, &hv) {
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				st.status = http.StatusServiceUnavailable
+				st.outcome = reqlog.OutcomeStreamError
+				// 上游 body 是活的（200 长流），随轮转立即关闭，不留给函数末尾的 defer 堆 fd。
+				rc.Close()
+				fail(acct.UID)
+				if hv.Payload == "" {
+					// 零有效帧：上游缺陷，不是账号的问题（不罚号），但换号值得一试。
+					lastErr = sErr
+					log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (no byte written, rotating)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+				} else {
+					// 帧内错误没有独立 HTTP 状态：末端映射只看 Kind，Status 仅作信封占位。
+					kind := upstream.FrameKind(hv.Payload)
+					h.applyErrorPolicy(acct.UID, kind, hv.Payload, bareModel, nil)
+					lastErr = &upstream.Error{Kind: kind, Msg: hv.Payload}
+					log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame before first byte kind=%s payload=%s (rotating)",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(hv.Payload, 200))
+				}
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转（首帧否决换号退避）
+				}
+				continue
+			}
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
 				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
@@ -1488,6 +1571,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, m, len(declaredTools))
 			}
+			// issue #44：声明了 tools 却拿到 finish_reason=stop 且全流零 tool_calls ——
+			// 上游把这个形态当正常收尾，客户端据此认为回合完成、工具一次没跑，用户
+			// 只能手动催一句。此前网关侧完全无痕（这是定位困难的主因），这里只记日志
+			// 并非把流改成错误：模型「判断不需要工具、直接回答」是合法行为，强行改写成
+			// 错误会让这类正常回合反复重试、每次都真实计费。
+			//
+			// 级别是 INFO 不是 WARN：这是合法收尾，不是故障。记 WARN 会进「错误汇总」
+			// 的兜底桶（其他（未归类）），把正常回合当成错误看待。
+			st.toolsDeclared = len(declaredTools)
+			if stats.SawToolCalls() {
+				st.toolCalls = 1
+			}
+			if len(declaredTools) > 0 && !stats.SawToolCalls() && stats.FinishReason() == "stop" {
+				log.Printf("INFO: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (本轮无工具调用，正常收尾)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, len(declaredTools))
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1528,6 +1627,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 				bareModel, m, len(declaredTools))
 		}
+		// issue #44 观测（非流式）：与流式同口径记下声明数与实际调用数。
+		st.toolsDeclared = len(declaredTools)
+		st.toolCalls = toolCallCount(resp)
 		credit, total, hasCredit := usageCreditTotal(resp)
 		if usage, ok := resp["usage"].(map[string]any); ok {
 			if hit, okH := upstream.UsageCacheHitTokens(usage); okH {
@@ -1714,7 +1816,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIErrorHint(w, status, code, msg, hint)
 	}
 	st.status = status
-	st.outcome = reqlog.OutcomeHTTPError
+	// 上游流级失败（首帧否决 / 流内 error 帧）的观测是 stream_error：客户端拿到 503
+	// 只是「网关没能提交流」的结果，不是另一类故障，别在这里洗成 http_error。
+	// 客户端主动断连（interrupted）同理：人走了不是网关的 HTTP 错误，别洗成
+	// http_error 混进失败统计。
+	if st.outcome != reqlog.OutcomeStreamError && st.outcome != reqlog.OutcomeInterrupted {
+		st.outcome = reqlog.OutcomeHTTPError
+	}
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。

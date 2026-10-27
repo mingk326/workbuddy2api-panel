@@ -66,6 +66,11 @@ type chatStat struct {
 	cacheMiss int64
 	hasCache  bool
 
+	// toolsDeclared / toolCalls 本轮工具面观测量（issue #44）：声明数与实际调用数。
+	// 前者 >0 且后者 ==0 即「零工具调用收尾」，归档里可据此算发生率。
+	toolsDeclared int
+	toolCalls     int
+
 	// 调用来源（客户端 IP / User-Agent）。空 = 未采集（logging.request_client_info
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
@@ -154,6 +159,10 @@ type chatStatsReader struct {
 	cacheMiss    int
 	hasCacheMiss bool
 	pend         []byte // 已读未返回的行缓存
+	// issue #44 观测：本流是否出现过非空 delta.tool_calls、最后一个非空 finish_reason。
+	// 两者组合用于识别「声明了 tools 却拿到 stop + 零 tool_calls」的静默回合。
+	sawToolCalls bool
+	finishReason string
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -172,6 +181,12 @@ func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredi
 
 // TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
 func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
+
+// SawToolCalls 报告本流是否出现过非空 delta.tool_calls（issue #44 观测）。
+func (s *chatStatsReader) SawToolCalls() bool { return s.sawToolCalls }
+
+// FinishReason 本流最后一个非空 finish_reason；上游没给过则为空串。
+func (s *chatStatsReader) FinishReason() string { return s.finishReason }
 
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
@@ -201,6 +216,14 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Error json.RawMessage `json:"error"`
+		// issue #44：只取 delta.tool_calls 与 finish_reason 两个字段。encoding/json
+		// 会跳过未声明的键（含 content），不为正文分配内存。
+		Choices []struct {
+			Delta struct {
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
 		Usage *struct {
 			PromptTokens         *int     `json:"prompt_tokens"`
 			CompletionTokens     *int     `json:"completion_tokens"`
@@ -210,14 +233,23 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
-		if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
-			s.errorFrame = true
-		}
+	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return
 	}
 	if len(chunk.Error) > 0 {
 		s.errorFrame = true
+	}
+	for _, c := range chunk.Choices {
+		// 上游每帧都带 "tool_calls":[]（空数组），所以判据是长度而不是字段存在。
+		if len(c.Delta.ToolCalls) > 0 {
+			s.sawToolCalls = true
+		}
+		if c.FinishReason != "" {
+			s.finishReason = c.FinishReason
+		}
+	}
+	if chunk.Usage == nil {
+		return
 	}
 	if chunk.Usage.PromptTokens != nil {
 		s.hasPromptTokens = true
@@ -355,6 +387,24 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	return delta
 }
 
+// toolCallCount 非流式聚合响应里的工具调用个数（issue #44 观测用）。
+// 只计数，不解析名字与参数。
+func toolCallCount(resp map[string]any) int {
+	choices, _ := resp["choices"].([]any)
+	if len(choices) == 0 {
+		return 0
+	}
+	ch, _ := choices[0].(map[string]any)
+	msg, _ := ch["message"].(map[string]any)
+	// upstream.Aggregate 组包用 []map[string]any，直解上游 JSON 是 []any —— 两种都得认，
+	// 否则非流式这一半永远是 0（issue #44 的比率就会被算高一倍）。
+	if tcs, ok := msg["tool_calls"].([]map[string]any); ok {
+		return len(tcs)
+	}
+	tcs, _ := msg["tool_calls"].([]any)
+	return len(tcs)
+}
+
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
 func completionTokens(resp map[string]any) int {
 	u, ok := resp["usage"].(map[string]any)
@@ -469,6 +519,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.ToolsDeclared = s.toolsDeclared
+		e.ToolCalls = s.toolCalls
 		// 请求记录页的思考档位列：与流水行 effort= 同一套溯源渲染（issue #43）。
 		e.Effort = effortLabel(s.effortClient, s.effortIn, s.effortOut)
 	}

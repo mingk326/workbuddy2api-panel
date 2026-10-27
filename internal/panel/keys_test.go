@@ -47,6 +47,20 @@ func doPanel(p *Panel, method, path, key, body string) *httptest.ResponseRecorde
 	return rec
 }
 
+// doPanelFrom 带指定来源地址的面板请求（鉴权失败日志按 IP 区分来源）。
+func doPanelFrom(p *Panel, method, path, key, remoteAddr string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	if remoteAddr != "" {
+		req.RemoteAddr = remoteAddr
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
 // TestPanelOnlyAdminKey 面板只认 admin 密钥；普通密钥 401（不泄露"密钥有效但无权"）。
 func TestPanelOnlyAdminKey(t *testing.T) {
 	live := livecfg.New(livecfg.Snapshot{APIKeys: []httpauth.Key{
@@ -64,8 +78,7 @@ func TestPanelOnlyAdminKey(t *testing.T) {
 		{"", 401},
 	}
 	for i, c := range cases {
-		// 每个用例换一个 IP：鉴权失败会按 IP 锁定一小时，共用 IP 会把后续
-		// 用例变成 429（锁定行为本身由 lockout_test.go 覆盖）。
+		// 每用例独立 IP（日志可区分来源；鉴权失败不再有锁定行为）。
 		remote := "198.51.100." + strconv.Itoa(i+1) + ":1234"
 		if got := doPanelFrom(p, "GET", "/panel/api/logs", c.key, remote).Code; got != c.want {
 			t.Errorf("key=%q code=%d want %d", c.key, got, c.want)

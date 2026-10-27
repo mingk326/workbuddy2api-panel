@@ -24,6 +24,7 @@
   ],
   "models": {
     "hidden": [],
+    "allowed": [],
     "aliases": []
   },
   "cn": {
@@ -32,10 +33,12 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
-    "read_timeout": "300s"
+    "read_timeout": "300s",
+    "shutdown_timeout": "30s"
   },
   "panel": {
-    "package_detail_limit": 5
+    "package_detail_limit": 5,
+    "poll_interval_sec": 0
   },
   "logging": {
     "request_archive_enabled": true,
@@ -93,7 +96,10 @@
     "task_sweep_minutes": 15,
     "include_disabled_in_tasks": false,
     "account_spread_minutes": 0,
-    "account_spread_min_gap_seconds": 30
+    "account_spread_min_gap_seconds": 30,
+    "balance_refresh_jitter_permill": 0,
+    "task_sweep_jitter_permill": 0,
+    "night_account_cap": 0
   },
   "global": {
     "enabled": true,
